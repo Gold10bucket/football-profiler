@@ -229,17 +229,6 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     df.columns = [c.replace("\n", "_").strip() for c in df.columns]
     df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
 
-    # Drop any leading non-data rows (Wyscout sub-header / title rows)
-    # Keep dropping from the top while the "Player" cell is empty/NaN
-    player_col = next((c for c in df.columns if c.lower() == "player"), None)
-    if player_col:
-        while len(df) > 0:
-            val = df.iloc[0].get(player_col, None)
-            if pd.isna(val) or str(val).strip() == "":
-                df = df.iloc[1:].reset_index(drop=True)
-            else:
-                break
-
     # Defensive column lookup helpers
     def _col(candidates):
         for c in candidates:
@@ -251,6 +240,11 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     age_col  = _col(["Age", "age", "Età"])
     name_col = _col(["Player", "player", "Name"])
     team_col = _col(["Team", "team", "Club", "Squadra"])
+
+    # Drop all non-player rows (sub-headers, title rows, totals, etc.)
+    # A real player row always has a numeric Age value.
+    if age_col:
+        df = df[pd.to_numeric(df[age_col], errors="coerce").notna()].reset_index(drop=True)
 
     df["_position_group"] = df[pos_col].apply(wy_position_group) if pos_col else "Unknown"
     df["_birth_year"]     = df[age_col].apply(_wy_birth_year)    if age_col  else None
