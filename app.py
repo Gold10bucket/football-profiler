@@ -138,7 +138,7 @@ def si_position_group(ruolo: str, ruolo_det: str) -> str:
 # ─── Name / age helpers ───────────────────────────────────────────────────────
 def _norm(name: str) -> str:
     """Uppercase ASCII, strip accents and punctuation."""
-    nfkd = unicodedata.normalize("NFKD", str(name))
+    nfkd = unicodedata.normalize("NFKD", str(name).upper())
     return re.sub(r"[^A-Z0-9 ]", "", nfkd.encode("ASCII", "ignore").decode()).strip()
 
 
@@ -590,6 +590,7 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
     ref_vec = _metric_vector(wy_row, si_row, metrics)
     ref_norm = np.linalg.norm(ref_vec)
 
+    score_metrics = PROFILES[profile_name]["metrics"]
     rows = []
     for _, p in master.iterrows():
         if p["Player"] == player_name:
@@ -605,12 +606,14 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
         cosine_sim = float(np.dot(ref_vec, vec) / (ref_norm * norm)) if ref_norm > 0 and norm > 0 else 0.0
         mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
         by   = p.get("_birth_year")
+        _, _, gl, _ = score_one(pw_row, ps_row, score_metrics, no_finishing=False)
         rows.append({
             "Player":     p["Player"],
             "Team":       p["Team"],
             "League":     p.get("League", ""),
             "Age":        (2025 - int(by)) if pd.notna(by) else "—",
             "Mins":       int(mins) if mins else "—",
+            "Score":      round(gl * 100, 1) if gl is not None else None,
             "Similarity": round(cosine_sim * 100, 1),
         })
 
@@ -1267,8 +1270,16 @@ if search.strip():
                 if val >= 90: return "background-color:#d4edda;color:#155724"
                 if val >= 75: return "background-color:#fff3cd;color:#856404"
                 return ""
+            def score_colour(val):
+                if not isinstance(val, (int, float)):
+                    return ""
+                if val >= 70: return "background-color:#d4edda;color:#155724"
+                if val >= 50: return "background-color:#fff3cd;color:#856404"
+                return "background-color:#f8d7da;color:#721c24"
             st.dataframe(
-                sim_df.style.map(sim_colour, subset=["Similarity"]),
+                sim_df.style
+                    .map(sim_colour, subset=["Similarity"])
+                    .map(score_colour, subset=["Score"]),
                 hide_index=True, use_container_width=True,
             )
 
