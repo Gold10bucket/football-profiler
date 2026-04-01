@@ -559,9 +559,23 @@ def _metric_vector(wy_row, si_row, metrics):
     return np.array(vec, dtype=float)
 
 
-def find_similar(player_name, profile_name, master, wy_df, si_df, n=15):
-    """Return DataFrame of most similar players to player_name under profile_name."""
-    metrics = PROFILES[profile_name]["metrics"]
+def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile"):
+    """
+    Return DataFrame of most similar players using cosine similarity.
+    mode='profile' → metrics from the selected profile only
+    mode='full'    → all metrics across every profile (full fingerprint)
+    """
+    if mode == "profile":
+        metrics = PROFILES[profile_name]["metrics"]
+    else:
+        # Deduplicated union of all metrics across all profiles (weight=1 each)
+        seen: set = set()
+        metrics = []
+        for p in PROFILES.values():
+            for m, _ in p["metrics"]:
+                if m not in seen:
+                    metrics.append((m, 1))
+                    seen.add(m)
 
     wy_row = None
     if wy_df is not None:
@@ -584,10 +598,7 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15):
         ps_row = _get_si_row(p["Player"], si_df, master)
         vec = _metric_vector(pw_row, ps_row, metrics)
         norm = np.linalg.norm(vec)
-        if ref_norm > 0 and norm > 0:
-            cosine_sim = float(np.dot(ref_vec, vec) / (ref_norm * norm))
-        else:
-            cosine_sim = 0.0
+        cosine_sim = float(np.dot(ref_vec, vec) / (ref_norm * norm)) if ref_norm > 0 and norm > 0 else 0.0
         mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
         by   = p.get("_birth_year")
         rows.append({
@@ -1229,8 +1240,18 @@ if search.strip():
 
         st.markdown("---")
         st.markdown("### 🔁 Similar players")
-        n_sim = st.slider("Number of similar players", 5, 50, 15, key="sim_slider")
-        sim_df = find_similar(player, active_profile, master, wy_df, si_df, n=n_sim)
+        sc1, sc2 = st.columns([2, 1])
+        with sc1:
+            n_sim = st.slider("Number of similar players", 5, 50, 15, key="sim_slider")
+        with sc2:
+            sim_mode = st.radio(
+                "Similarity based on",
+                ["Profile metrics", "Full dataset"],
+                help="Profile metrics: cosine similarity on the selected profile's metrics only.\nFull dataset: all metrics across every profile — broader stylistic fingerprint.",
+                key="sim_mode",
+            )
+        sim_df = find_similar(player, active_profile, master, wy_df, si_df, n=n_sim,
+                              mode="profile" if sim_mode == "Profile metrics" else "full")
         if sim_df.empty:
             st.info("No similar players found.")
         else:
