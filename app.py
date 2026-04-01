@@ -1042,6 +1042,6 @@ else:
 
             display = scored[["Player", "Team", "Pos", "Mins", "Global", "Wyscout", "SICS", "Data %"]].head(n_similar)
             st.dataframe(
-                display.style.applymap(colour, subset=["Global"]),
+                display.style.map(colour, subset=["Global"]),
                 use_container_width=True,
             )
