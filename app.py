@@ -143,13 +143,19 @@ def _norm(name: str) -> str:
 
 
 def _birth_year_from_nazionalita(s) -> int | None:
-    """Extract birth year from SICS Nazionalità like 'Italia (\'04)'."""
+    """Extract birth year from SICS fields like 'Italia (\'04)' or '2004' or '04'."""
     if pd.isna(s):
         return None
-    m = re.search(r"\('(\d{2})\)", str(s))
+    s = str(s)
+    # 4-digit year anywhere in string
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", s)
+    if m:
+        return int(m.group(1))
+    # 2-digit year in parentheses: ('04)
+    m = re.search(r"\('?(\d{2})'?\)", s)
     if m:
         y = int(m.group(1))
-        return 2000 + y if y <= 25 else 1900 + y
+        return 2000 + y if y <= 30 else 1900 + y
     return None
 
 
@@ -329,19 +335,26 @@ def merge_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.
 
     def _find_si(last: str, fi: str, by: int | None) -> str | None:
         by = int(by) if by and not pd.isna(by) else 0
-        # Exact match first
+        # 1. Exact birth year match
         if (last, fi, by) in si_lookup:
             return si_lookup[(last, fi, by)]
-        # ±1 year tolerance
+        # 2. ±1 year tolerance
         for delta in (-1, 1):
-            key = (last, fi, by + delta)
-            if key in si_lookup:
-                return si_lookup[key]
-        # Last name + initial only (no birth year in one dataset)
-        if by == 0:
-            candidates = [v for (l, f, _), v in si_lookup.items() if l == last and f == fi]
-            if len(candidates) == 1:
-                return candidates[0]
+            if (last, fi, by + delta) in si_lookup:
+                return si_lookup[(last, fi, by + delta)]
+        # 3. ±2 year tolerance (age rounding across season boundaries)
+        for delta in (-2, 2):
+            if (last, fi, by + delta) in si_lookup:
+                return si_lookup[(last, fi, by + delta)]
+        # 4. Name + initial only — always try, use only if unique
+        #    Covers cases where one dataset has no birth year (by=0)
+        candidates = [v for (l, f, _), v in si_lookup.items() if l == last and f == fi]
+        if len(candidates) == 1:
+            return candidates[0]
+        # 5. Last name only — last resort, use only if unique
+        candidates_ln = [v for (l, _, _), v in si_lookup.items() if l == last]
+        if len(candidates_ln) == 1:
+            return candidates_ln[0]
         return None
 
     # Process Wyscout players
