@@ -229,17 +229,34 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     df.columns = [c.replace("\n", "_").strip() for c in df.columns]
     df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
 
-    # Drop Wyscout sub-header row (the second CSV row that continues
-    # multi-line column names like "Cmp %", "Being Short", etc.)
-    if len(df) > 0:
-        first_player = df.iloc[0].get("Player", None)
-        if pd.isna(first_player) or str(first_player).strip() == "":
-            df = df.iloc[1:].reset_index(drop=True)
-    df["_position_group"] = df["Position"].apply(wy_position_group)
-    df["_birth_year"] = df["Age"].apply(_wy_birth_year)
-    df["_last_name"] = df["Player"].apply(_wy_last_name)
-    df["_first_initial"] = df["Player"].apply(_wy_first_initial)
-    df["_team_norm"] = df["Team"].fillna("").apply(lambda x: _norm(str(x)))
+    # Drop any leading non-data rows (Wyscout sub-header / title rows)
+    # Keep dropping from the top while the "Player" cell is empty/NaN
+    player_col = next((c for c in df.columns if c.lower() == "player"), None)
+    if player_col:
+        while len(df) > 0:
+            val = df.iloc[0].get(player_col, None)
+            if pd.isna(val) or str(val).strip() == "":
+                df = df.iloc[1:].reset_index(drop=True)
+            else:
+                break
+
+    # Defensive column lookup helpers
+    def _col(candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    pos_col  = _col(["Position", "Pos", "position"])
+    age_col  = _col(["Age", "age", "Età"])
+    name_col = _col(["Player", "player", "Name"])
+    team_col = _col(["Team", "team", "Club", "Squadra"])
+
+    df["_position_group"] = df[pos_col].apply(wy_position_group) if pos_col else "Unknown"
+    df["_birth_year"]     = df[age_col].apply(_wy_birth_year)    if age_col  else None
+    df["_last_name"]      = df[name_col].apply(_wy_last_name)    if name_col else ""
+    df["_first_initial"]  = df[name_col].apply(_wy_first_initial) if name_col else ""
+    df["_team_norm"]      = df[team_col].fillna("").apply(lambda x: _norm(str(x))) if team_col else ""
 
     # Detect minutes column (Wyscout exports vary)
     for _mc in ["Minutes played", "Minutes", "Mins played", "Min"]:
@@ -578,9 +595,11 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15):
         else:
             cosine_sim = 0.0
         mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
+        by   = p.get("_birth_year")
         rows.append({
             "Player":     p["Player"],
             "Team":       p["Team"],
+            "Age":        (2025 - int(by)) if pd.notna(by) else "—",
             "Mins":       int(mins) if mins else "—",
             "Similarity": round(cosine_sim * 100, 1),
         })
