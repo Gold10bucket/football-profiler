@@ -228,6 +228,13 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.replace("\n", "_").strip() for c in df.columns]
     df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    # Drop Wyscout sub-header row (the second CSV row that continues
+    # multi-line column names like "Cmp %", "Being Short", etc.)
+    if len(df) > 0:
+        first_player = df.iloc[0].get("Player", None)
+        if pd.isna(first_player) or str(first_player).strip() == "":
+            df = df.iloc[1:].reset_index(drop=True)
     df["_position_group"] = df["Position"].apply(wy_position_group)
     df["_birth_year"] = df["Age"].apply(_wy_birth_year)
     df["_last_name"] = df["Player"].apply(_wy_last_name)
@@ -673,7 +680,8 @@ def build_export(master, wy_df, si_df):
 
 
 def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
-                      min_minutes=0, position_group=None, matched_only=False):
+                      min_minutes=0, position_group=None, matched_only=False,
+                      age_min=15, age_max=45):
     metrics = PROFILES[profile_name]["metrics"]
     rows = []
     for _, p in master.iterrows():
@@ -682,6 +690,11 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
             continue
         if matched_only and pd.isna(p.get("_si")):
             continue
+        by = p.get("_birth_year")
+        if pd.notna(by):
+            age = 2025 - int(by)
+            if not (age_min <= age <= age_max):
+                continue
         mins_raw = p.get("Minutes")
         if pd.notna(mins_raw):
             mins = float(mins_raw)
@@ -703,9 +716,12 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
         if gl is None:
             continue
 
+        by = p.get("_birth_year")
+        age_val = (2025 - int(by)) if pd.notna(by) else "—"
         rows.append({
             "Player":        p["Player"],
             "Team":          p["Team"],
+            "Age":           age_val,
             "Pos":           p.get("_position_group", p.get("Position", "")),
             "Mins":          int(mins) if mins else "—",
             "Global":        round(gl * 100, 1),
@@ -716,7 +732,7 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
         })
 
     if not rows:
-        return pd.DataFrame(columns=["Player", "Team", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"])
+        return pd.DataFrame(columns=["Player", "Team", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"])
     df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
     df.index += 1
     return df
@@ -985,7 +1001,7 @@ PROFILES = {
 }
 
 # ─── Session state init ───────────────────────────────────────────────────────
-for key, default in [("wy_bytes", None), ("si_bytes", None), ("group", None), ("min_mins", 500), ("upload_done", False)]:
+for key, default in [("wy_bytes", None), ("si_bytes", None), ("group", None), ("min_mins", 500), ("upload_done", False), ("age_min", 15), ("age_max", 40)]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -1084,8 +1100,11 @@ with st.sidebar:
         st.session_state.upload_done = False
         st.rerun()
     st.markdown("---")
-    st.session_state.min_mins = st.slider("Min minutes", 100, 2000,
+    st.session_state.min_mins = st.slider("Min minutes", 0, 2000,
                                            st.session_state.min_mins, 50)
+    age_range = st.slider("Age range", 15, 45,
+                          (st.session_state.age_min, st.session_state.age_max))
+    st.session_state.age_min, st.session_state.age_max = age_range
     filter_pos    = st.toggle("Filter by position group", True,
                                help="Only show players mapped to this position group")
     matched_only  = st.toggle("Matched players only", False,
@@ -1230,6 +1249,8 @@ else:
                 min_minutes=st.session_state.min_mins,
                 position_group=pos_filter,
                 matched_only=matched_only,
+                age_min=st.session_state.age_min,
+                age_max=st.session_state.age_max,
             )
             if scored.empty:
                 st.info("No players found. Try lowering the minutes threshold or disabling position filter.")
@@ -1242,7 +1263,7 @@ else:
                 if val >= 50: return "background-color:#fff3cd;color:#856404"
                 return "background-color:#f8d7da;color:#721c24"
 
-            display = scored[["Player", "Team", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"]]
+            display = scored[["Player", "Team", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"]]
             st.dataframe(
                 display.style.map(colour, subset=["Global", "No Finishing"]),
                 use_container_width=True,
