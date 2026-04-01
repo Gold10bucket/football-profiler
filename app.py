@@ -818,7 +818,7 @@ PROFILES = {
 }
 
 # ─── Session state init ───────────────────────────────────────────────────────
-for key, default in [("wy_bytes", None), ("si_bytes", None), ("group", None), ("min_mins", 500)]:
+for key, default in [("wy_bytes", None), ("si_bytes", None), ("group", None), ("min_mins", 500), ("upload_done", False)]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -828,7 +828,7 @@ si_df  = process_sics(st.session_state.si_bytes)    if st.session_state.si_bytes
 master = merge_players(wy_df, si_df) if (wy_df is not None or si_df is not None) else None
 
 # ─── STEP 1 — Upload ──────────────────────────────────────────────────────────
-if wy_df is None:
+if wy_df is None or not st.session_state.get("upload_done"):
     st.title("⚽ Football Profiler")
     st.markdown("Upload your data files to get started.")
     st.markdown("---")
@@ -840,6 +840,8 @@ if wy_df is None:
         if wy_file:
             st.session_state.wy_bytes = wy_file.read()
             st.rerun()
+        if st.session_state.wy_bytes:
+            st.success("✓ Wyscout loaded")
     with col2:
         st.subheader("2 · SICS CSV  *(optional)*")
         st.caption("SICS.tv export. Adds 30% weight to the global score.")
@@ -847,6 +849,18 @@ if wy_df is None:
         if si_file:
             st.session_state.si_bytes = si_file.read()
             st.rerun()
+        if st.session_state.si_bytes:
+            st.success("✓ SICS loaded")
+        else:
+            if st.button("Skip SICS →", disabled=wy_df is None):
+                st.session_state.upload_done = True
+                st.rerun()
+    if wy_df is not None and si_df is not None:
+        if st.button("Continue →", type="primary"):
+            st.session_state.upload_done = True
+            st.rerun()
+    elif wy_df is None:
+        st.info("Upload the Wyscout CSV to continue.")
     st.stop()
 
 # ─── STEP 2 — Pick position group ─────────────────────────────────────────────
@@ -856,6 +870,7 @@ if st.session_state.group is None:
         if st.button("← Change data"):
             st.session_state.wy_bytes = None
             st.session_state.si_bytes = None
+            st.session_state.upload_done = False
             st.rerun()
         st.session_state.min_mins = st.slider("Min minutes", 100, 2000, 500, 50)
 
@@ -889,6 +904,7 @@ with st.sidebar:
         st.session_state.wy_bytes = None
         st.session_state.si_bytes = None
         st.session_state.group = None
+        st.session_state.upload_done = False
         st.rerun()
     st.markdown("---")
     st.session_state.min_mins = st.slider("Min minutes", 100, 2000,
