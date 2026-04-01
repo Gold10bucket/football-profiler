@@ -828,7 +828,7 @@ si_df  = process_sics(st.session_state.si_bytes)    if st.session_state.si_bytes
 master = merge_players(wy_df, si_df) if (wy_df is not None or si_df is not None) else None
 
 # ─── STEP 1 — Upload ──────────────────────────────────────────────────────────
-if wy_df is None or not st.session_state.get("upload_done"):
+if not st.session_state.get("upload_done"):
     st.title("⚽ Football Profiler")
     st.markdown("Upload your data files to get started.")
     st.markdown("---")
@@ -839,7 +839,6 @@ if wy_df is None or not st.session_state.get("upload_done"):
         wy_file = st.file_uploader("", type="csv", key="wy_upload", label_visibility="collapsed")
         if wy_file:
             st.session_state.wy_bytes = wy_file.read()
-            st.rerun()
         if st.session_state.wy_bytes:
             st.success("✓ Wyscout loaded")
     with col2:
@@ -848,11 +847,10 @@ if wy_df is None or not st.session_state.get("upload_done"):
         si_file = st.file_uploader("", type="csv", key="si_upload", label_visibility="collapsed")
         if si_file:
             st.session_state.si_bytes = si_file.read()
-            st.rerun()
         if st.session_state.si_bytes:
             st.success("✓ SICS loaded")
     st.markdown("---")
-    if wy_df is None:
+    if not st.session_state.wy_bytes:
         st.info("Upload the Wyscout CSV to continue.")
     else:
         if st.button("Continue →", type="primary", use_container_width=True):
