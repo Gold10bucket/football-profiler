@@ -851,16 +851,13 @@ if wy_df is None or not st.session_state.get("upload_done"):
             st.rerun()
         if st.session_state.si_bytes:
             st.success("✓ SICS loaded")
-        else:
-            if st.button("Skip SICS →", disabled=wy_df is None):
-                st.session_state.upload_done = True
-                st.rerun()
-    if wy_df is not None and si_df is not None:
-        if st.button("Continue →", type="primary"):
+    st.markdown("---")
+    if wy_df is None:
+        st.info("Upload the Wyscout CSV to continue.")
+    else:
+        if st.button("Continue →", type="primary", use_container_width=True):
             st.session_state.upload_done = True
             st.rerun()
-    elif wy_df is None:
-        st.info("Upload the Wyscout CSV to continue.")
     st.stop()
 
 # ─── STEP 2 — Pick position group ─────────────────────────────────────────────
