@@ -503,12 +503,24 @@ def build_export(master, wy_df, si_df):
                 v_wy = float(wy_row[wy_col])
                 if metric in INVERTED:
                     v_wy = 1 - v_wy
-            row[f"WY: {metric}"] = round(v_wy * 100, 1) if v_wy is not None else ""
+            row[f"WY pct: {metric}"] = round(v_wy * 100, 1) if v_wy is not None else ""
 
             v_si = None
             if si_row is not None and metric in si_row.index and pd.notna(si_row[metric]):
                 v_si = float(si_row[metric])
-            row[f"SI: {metric}"] = round(v_si * 100, 1) if v_si is not None else ""
+            row[f"SI pct: {metric}"] = round(v_si * 100, 1) if v_si is not None else ""
+
+        # Raw Wyscout stat columns
+        if wy_row is not None:
+            for col in wy_row.index:
+                if not col.startswith("_"):
+                    row[f"WY raw: {col}"] = wy_row[col]
+
+        # Raw SICS computed values (non-percentile)
+        if si_row is not None:
+            for col in si_row.index:
+                if not col.startswith("_"):
+                    row[f"SI raw: {col}"] = round(float(si_row[col]), 4) if pd.notna(si_row[col]) else ""
 
         rows.append(row)
 
@@ -535,19 +547,21 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
 
         si_row = _get_si_row(p["Player"], si_df, master)
 
-        wy_s, si_s, gl, cov = score_one(wy_row, si_row, metrics, no_finishing)
+        wy_s, si_s, gl, cov = score_one(wy_row, si_row, metrics, no_finishing=False)
+        _, _, gl_nf, _ = score_one(wy_row, si_row, metrics, no_finishing=True)
         if gl is None:
             continue
 
         rows.append({
-            "Player":   p["Player"],
-            "Team":     p["Team"],
-            "Pos":      p.get("_position_group", p.get("Position", "")),
-            "Mins":     int(mins) if mins else "—",
-            "Global":   round(gl * 100, 1),
-            "Wyscout":  round(wy_s * 100, 1) if wy_s is not None else None,
-            "SICS":     round(si_s * 100, 1) if si_s is not None else None,
-            "Data %":   f"{cov*100:.0f}%",
+            "Player":        p["Player"],
+            "Team":          p["Team"],
+            "Pos":           p.get("_position_group", p.get("Position", "")),
+            "Mins":          int(mins) if mins else "—",
+            "Global":        round(gl * 100, 1),
+            "No Finishing":  round(gl_nf * 100, 1) if gl_nf is not None else None,
+            "Wyscout":       round(wy_s * 100, 1) if wy_s is not None else None,
+            "SICS":          round(si_s * 100, 1) if si_s is not None else None,
+            "Data %":        f"{cov*100:.0f}%",
         })
 
     df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
@@ -908,7 +922,6 @@ with st.sidebar:
                              help="Only show players mapped to this position group")
     no_finishing = st.toggle("Without finishing", False,
                               help="Excludes xG, shots, goals, conversion rate")
-    n_similar    = st.slider("Players to show", 5, 50, 15)
     st.markdown("---")
     st.markdown("**Export**")
     if st.button("Build full export CSV", use_container_width=True):
@@ -1040,8 +1053,8 @@ else:
                 if val >= 50: return "background-color:#fff3cd;color:#856404"
                 return "background-color:#f8d7da;color:#721c24"
 
-            display = scored[["Player", "Team", "Pos", "Mins", "Global", "Wyscout", "SICS", "Data %"]].head(n_similar)
+            display = scored[["Player", "Team", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"]]
             st.dataframe(
-                display.style.map(colour, subset=["Global"]),
+                display.style.map(colour, subset=["Global", "No Finishing"]),
                 use_container_width=True,
             )
