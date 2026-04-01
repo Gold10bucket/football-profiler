@@ -232,14 +232,21 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     df["_birth_year"] = df["Age"].apply(_wy_birth_year)
     df["_last_name"] = df["Player"].apply(_wy_last_name)
     df["_first_initial"] = df["Player"].apply(_wy_first_initial)
+    df["_team_norm"] = df["Team"].fillna("").apply(lambda x: _norm(str(x)))
 
-    # Percentile-rank all stat columns used in WY_MAP so scores are 0–1,
-    # matching the SICS percentile format used in score_one.
+    # Detect minutes column (Wyscout exports vary)
+    for _mc in ["Minutes played", "Minutes", "Mins played", "Min"]:
+        if _mc in df.columns:
+            df["_minutes"] = pd.to_numeric(df[_mc], errors="coerce").fillna(0)
+            break
+    else:
+        df["_minutes"] = np.nan  # not available — won't be filtered out
+
+    # ── Step 2a: percentile-rank all WY_MAP stat columns (0–1) ─────────────────
     wy_target_cols = {v for v in WY_MAP.values() if v is not None}
     for col in wy_target_cols:
         if col in df.columns:
-            numeric = pd.to_numeric(df[col], errors="coerce")
-            df[col] = numeric.rank(pct=True, na_option="bottom")
+            df[col] = pd.to_numeric(df[col], errors="coerce").rank(pct=True, na_option="bottom")
 
     return df
 
@@ -323,75 +330,113 @@ def process_sics(file_bytes: bytes) -> pd.DataFrame:
     return result
 
 
-# ─── Player master list (Wyscout is canonical; SICS enriches) ─────────────────
-def merge_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.DataFrame:
+# ─── Step 1: Match players between Wyscout and SICS ──────────────────────────
+def _team_words(t: str) -> set:
+    """Normalised set of meaningful words from a team name."""
+    stop = {"FC", "AC", "SC", "SSD", "ASD", "SS", "US", "AS", "CF", "1", "2"}
+    return {w for w in _norm(str(t)).split() if w not in stop and len(w) > 1}
+
+
+def match_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.DataFrame:
     """
-    Build deduplicated master player list.
-    Matching: last name + first initial + birth year (±1 yr tolerance).
+    Returns a DataFrame with one row per unique player:
+      wy_player, si_player, match_type, Player (display), Team,
+      _position_group, _birth_year, Minutes, _si (alias for si_player)
+    match_type: 'exact' | 'year±1' | 'year±2' | 'name' | 'lastname' | 'wy_only' | 'si_only'
     """
-    rows = []
+    rows: list[dict] = []
     seen_si: set[str] = set()
 
-    # Build SICS lookup: (last_name, first_initial, birth_year) → si_index_name
-    si_lookup: dict[tuple, str] = {}
+    # ── Build SICS lookup buckets ──────────────────────────────────────────────
+    # bucket: (last, fi, by) → list of si_names
+    from collections import defaultdict
+    si_bucket: dict[tuple, list[str]] = defaultdict(list)
+    si_ln_bucket: dict[str, list[str]] = defaultdict(list)
+
     if si_df is not None:
         for si_name in si_df.index:
-            ln  = si_df.loc[si_name, "_last_name"] if "_last_name" in si_df.columns else _si_last_name(si_name)
-            fi  = si_df.loc[si_name, "_first_initial"] if "_first_initial" in si_df.columns else _si_first_initial(si_name)
-            by  = si_df.loc[si_name, "_birth_year"] if "_birth_year" in si_df.columns else None
-            by  = int(by) if by and not pd.isna(by) else 0
-            si_lookup[(ln, fi, by)] = si_name
+            ln = si_df.loc[si_name, "_last_name"] if "_last_name" in si_df.columns else _si_last_name(si_name)
+            fi = si_df.loc[si_name, "_first_initial"] if "_first_initial" in si_df.columns else _si_first_initial(si_name)
+            by_raw = si_df.loc[si_name, "_birth_year"] if "_birth_year" in si_df.columns else None
+            by = int(by_raw) if by_raw and not pd.isna(by_raw) else 0
+            si_bucket[(ln, fi, by)].append(si_name)
+            si_ln_bucket[ln].append(si_name)
 
-    def _find_si(last: str, fi: str, by: int | None) -> str | None:
-        by = int(by) if by and not pd.isna(by) else 0
-        # 1. Exact birth year match
-        if (last, fi, by) in si_lookup:
-            return si_lookup[(last, fi, by)]
-        # 2. ±1 year tolerance
-        for delta in (-1, 1):
-            if (last, fi, by + delta) in si_lookup:
-                return si_lookup[(last, fi, by + delta)]
-        # 3. ±2 year tolerance (age rounding across season boundaries)
-        for delta in (-2, 2):
-            if (last, fi, by + delta) in si_lookup:
-                return si_lookup[(last, fi, by + delta)]
-        # 4. Name + initial only — always try, use only if unique
-        #    Covers cases where one dataset has no birth year (by=0)
-        candidates = [v for (l, f, _), v in si_lookup.items() if l == last and f == fi]
+    def _team_sim(wy_team: str, si_name: str) -> float:
+        """Word-overlap score between Wyscout team and SICS team."""
+        if si_df is None:
+            return 0.0
+        si_team = si_df.loc[si_name, "_team"] if "_team" in si_df.columns else ""
+        wy_w = _team_words(wy_team)
+        si_w = _team_words(str(si_team))
+        if not wy_w or not si_w:
+            return 0.0
+        return len(wy_w & si_w) / max(len(wy_w), len(si_w))
+
+    def _pick(candidates: list[str], wy_team: str) -> str:
+        """From a list of candidates, prefer the one with best team similarity."""
         if len(candidates) == 1:
             return candidates[0]
-        # 5. Last name only — last resort, use only if unique
-        candidates_ln = [v for (l, _, _), v in si_lookup.items() if l == last]
-        if len(candidates_ln) == 1:
-            return candidates_ln[0]
-        return None
+        best = max(candidates, key=lambda c: _team_sim(wy_team, c))
+        return best
 
-    # Process Wyscout players
+    def _find_si(last: str, fi: str, by: int | None, wy_team: str) -> tuple[str | None, str]:
+        by = int(by) if by and not pd.isna(by) else 0
+        # 1. Exact
+        if si_bucket.get((last, fi, by)):
+            return _pick(si_bucket[(last, fi, by)], wy_team), "exact"
+        # 2. ±1 year
+        for d in (-1, 1):
+            if si_bucket.get((last, fi, by + d)):
+                return _pick(si_bucket[(last, fi, by + d)], wy_team), "year±1"
+        # 3. ±2 years
+        for d in (-2, 2):
+            if si_bucket.get((last, fi, by + d)):
+                return _pick(si_bucket[(last, fi, by + d)], wy_team), "year±2"
+        # 4. Name + initial across all birth years
+        cands = [c for key, lst in si_bucket.items() if key[0] == last and key[1] == fi for c in lst]
+        if cands:
+            return _pick(cands, wy_team), "name"
+        # 5. Last name only
+        if si_ln_bucket.get(last):
+            return _pick(si_ln_bucket[last], wy_team), "lastname"
+        return None, "wy_only"
+
+    # ── Step 3a: Process Wyscout players ──────────────────────────────────────
     if wy_df is not None:
         for _, row in wy_df.iterrows():
-            last = row.get("_last_name", _wy_last_name(row["Player"]))
-            fi   = row.get("_first_initial", _wy_first_initial(row["Player"]))
-            by   = row.get("_birth_year")
-            si_name = _find_si(last, fi, by)
+            last    = row.get("_last_name", _wy_last_name(row["Player"]))
+            fi      = row.get("_first_initial", _wy_first_initial(row["Player"]))
+            by      = row.get("_birth_year")
+            wy_team = str(row.get("Team", ""))
+            wy_mins = row.get("_minutes")
+
+            si_name, mtype = _find_si(last, fi, by, wy_team)
             if si_name:
                 seen_si.add(si_name)
-                si_mins = si_df.loc[si_name, "_minutes"] if si_df is not None else None
-                team    = si_df.loc[si_name, "_team"]    if si_df is not None else row.get("Team", "")
+                si_mins = si_df.loc[si_name, "_minutes"] if si_df is not None else np.nan
+                # Use SICS minutes if available (more accurate), else Wyscout
+                minutes = si_mins if pd.notna(si_mins) and si_mins > 0 else wy_mins
+                team    = si_df.loc[si_name, "_team"] if si_df is not None else wy_team
+                pos_grp = row.get("_position_group", "Unknown")
             else:
-                si_mins = None
-                team    = row.get("Team", "")
+                si_mins = np.nan
+                minutes = wy_mins
+                team    = wy_team
+                pos_grp = row.get("_position_group", "Unknown")
 
             rows.append({
                 "Player":          row["Player"],
                 "Team":            team,
                 "Position":        row.get("Position", ""),
-                "_position_group": row.get("_position_group", "Unknown"),
+                "_position_group": pos_grp,
                 "_birth_year":     by,
-                "Minutes":         si_mins,
+                "Minutes":         minutes,
                 "_si":             si_name,
+                "_match_type":     mtype,
             })
 
-    # Add SICS-only players
+    # ── Step 3b: SICS-only players ────────────────────────────────────────────
     if si_df is not None:
         for si_name in si_df.index:
             if si_name in seen_si:
@@ -404,9 +449,15 @@ def merge_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.
                 "_birth_year":     si_df.loc[si_name, "_birth_year"] if "_birth_year" in si_df.columns else None,
                 "Minutes":         si_df.loc[si_name, "_minutes"],
                 "_si":             si_name,
+                "_match_type":     "si_only",
             })
 
     return pd.DataFrame(rows)
+
+
+def merge_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Thin wrapper kept for compatibility — delegates to match_players."""
+    return match_players(wy_df, si_df)
 
 
 # ─── Scoring ──────────────────────────────────────────────────────────────────
@@ -622,16 +673,22 @@ def build_export(master, wy_df, si_df):
 
 
 def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
-                      min_minutes=0, position_group=None):
+                      min_minutes=0, position_group=None, matched_only=False):
     metrics = PROFILES[profile_name]["metrics"]
     rows = []
     for _, p in master.iterrows():
-        # Position filter
+        # Filters
         if position_group and p.get("_position_group") not in (position_group, "Unknown"):
             continue
-        mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
-        if mins < min_minutes:
+        if matched_only and pd.isna(p.get("_si")):
             continue
+        mins_raw = p.get("Minutes")
+        if pd.notna(mins_raw):
+            mins = float(mins_raw)
+            if mins < min_minutes:
+                continue
+        else:
+            mins = 0  # unknown — include player but show 0
 
         wy_row = None
         if wy_df is not None:
@@ -658,6 +715,8 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
             "Data %":        f"{cov*100:.0f}%",
         })
 
+    if not rows:
+        return pd.DataFrame(columns=["Player", "Team", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"])
     df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
     df.index += 1
     return df
@@ -980,20 +1039,21 @@ if st.session_state.group is None:
     n_wy = len(wy_df) if wy_df is not None else 0
     n_si = len(si_df) if si_df is not None else 0
     n_matched = len(master[master["_si"].notna()]) if master is not None else 0
-    st.success(f"Data loaded — {n_wy} Wyscout · {n_si} SICS · **{n_matched} matched**")
+    n_wy_only = len(master[master["_match_type"] == "wy_only"]) if master is not None and "_match_type" in master.columns else 0
+    n_si_only = len(master[master["_match_type"] == "si_only"]) if master is not None and "_match_type" in master.columns else 0
+    st.success(f"Data loaded — {n_wy} Wyscout · {n_si} SICS · **{n_matched} matched** · {n_wy_only} WY-only · {n_si_only} SI-only")
     with st.expander("🔍 Merge diagnostics", expanded=False):
-        if master is not None:
-            matched = master[master["_si"].notna()][["Player", "Team", "_si", "_birth_year"]].head(20)
-            unmatched = master[master["_si"].isna()][["Player", "Team", "_birth_year"]].head(20)
-            st.markdown(f"**Matched ({n_matched})** — first 20:")
+        if master is not None and "_match_type" in master.columns:
+            type_counts = master["_match_type"].value_counts()
+            st.dataframe(type_counts.rename("count").reset_index().rename(columns={"index": "match_type"}),
+                         hide_index=True, use_container_width=True)
+            matched = master[master["_si"].notna()][["Player", "Team", "_si", "_birth_year", "_match_type"]].head(30)
+            st.markdown(f"**Matched players — first 30:**")
             st.dataframe(matched, hide_index=True, use_container_width=True)
-            st.markdown(f"**Wyscout-only (no SICS match)** — first 20:")
-            st.dataframe(unmatched, hide_index=True, use_container_width=True)
             if wy_df is not None:
-                wy_cols_present = [c for c in WY_MAP.values() if c and c in wy_df.columns]
                 wy_cols_missing = [c for c in WY_MAP.values() if c and c not in wy_df.columns]
-                st.markdown(f"**WY_MAP columns found in CSV ({len(wy_cols_present)}):** {wy_cols_present}")
-                st.markdown(f"**WY_MAP columns missing ({len(wy_cols_missing)}):** {wy_cols_missing}")
+                if wy_cols_missing:
+                    st.warning(f"WY_MAP columns missing from CSV: {wy_cols_missing}")
     st.markdown("### Select a position group")
     st.markdown(" ")
     icons = {"Forwards": "⚡", "Wide Players": "↔️", "Midfielders": "🔄",
@@ -1026,10 +1086,12 @@ with st.sidebar:
     st.markdown("---")
     st.session_state.min_mins = st.slider("Min minutes", 100, 2000,
                                            st.session_state.min_mins, 50)
-    filter_pos  = st.toggle("Filter by position group", True,
-                             help="Only show players mapped to this position group")
-    no_finishing = st.toggle("Without finishing", False,
-                              help="Excludes xG, shots, goals, conversion rate")
+    filter_pos    = st.toggle("Filter by position group", True,
+                               help="Only show players mapped to this position group")
+    matched_only  = st.toggle("Matched players only", False,
+                               help="Only show players found in both Wyscout and SICS")
+    no_finishing  = st.toggle("Without finishing", False,
+                               help="Excludes xG, shots, goals, conversion rate")
     st.markdown("---")
     st.markdown("**Export**")
     if st.button("Build full export CSV", use_container_width=True):
@@ -1167,6 +1229,7 @@ else:
                 no_finishing=no_finishing,
                 min_minutes=st.session_state.min_mins,
                 position_group=pos_filter,
+                matched_only=matched_only,
             )
             if scored.empty:
                 st.info("No players found. Try lowering the minutes threshold or disabling position filter.")
