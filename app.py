@@ -251,6 +251,8 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     df["_last_name"]      = df[name_col].apply(_wy_last_name)    if name_col else ""
     df["_first_initial"]  = df[name_col].apply(_wy_first_initial) if name_col else ""
     df["_team_norm"]      = df[team_col].fillna("").apply(lambda x: _norm(str(x))) if team_col else ""
+    league_col = _col(["League", "league", "Competition", "Lega"])
+    df["_league"] = df[league_col].fillna("") if league_col else ""
 
     # Detect minutes column (Wyscout exports vary)
     for _mc in ["Minutes played", "Minutes", "Mins played", "Min"]:
@@ -446,6 +448,7 @@ def match_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.
             rows.append({
                 "Player":          row["Player"],
                 "Team":            team,
+                "League":          row.get("_league", ""),
                 "Position":        row.get("Position", ""),
                 "_position_group": pos_grp,
                 "_birth_year":     by,
@@ -462,6 +465,7 @@ def match_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.
             rows.append({
                 "Player":          si_name,
                 "Team":            si_df.loc[si_name, "_team"],
+                "League":          "",
                 "Position":        si_df.loc[si_name, "_position_group"],
                 "_position_group": si_df.loc[si_name, "_position_group"],
                 "_birth_year":     si_df.loc[si_name, "_birth_year"] if "_birth_year" in si_df.columns else None,
@@ -604,6 +608,7 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
         rows.append({
             "Player":     p["Player"],
             "Team":       p["Team"],
+            "League":     p.get("League", ""),
             "Age":        (2025 - int(by)) if pd.notna(by) else "—",
             "Mins":       int(mins) if mins else "—",
             "Similarity": round(cosine_sim * 100, 1),
@@ -745,6 +750,7 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
         rows.append({
             "Player":        p["Player"],
             "Team":          p["Team"],
+            "League":        p.get("League", ""),
             "Age":           age_val,
             "Pos":           p.get("_position_group", p.get("Position", "")),
             "Mins":          int(mins) if mins else "—",
@@ -756,7 +762,7 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
         })
 
     if not rows:
-        return pd.DataFrame(columns=["Player", "Team", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"])
+        return pd.DataFrame(columns=["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"])
     df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
     df.index += 1
     return df
@@ -1297,7 +1303,7 @@ else:
                 if val >= 50: return "background-color:#fff3cd;color:#856404"
                 return "background-color:#f8d7da;color:#721c24"
 
-            display = scored[["Player", "Team", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"]]
+            display = scored[["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"]]
             st.dataframe(
                 display.style.map(colour, subset=["Global", "No Finishing"]),
                 use_container_width=True,
