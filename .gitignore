@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Data files — don't commit CSVs to the repo
+*.csv
+*.xlsx
+*.xls
+data/
+
+# Streamlit cache
+.streamlit/
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
