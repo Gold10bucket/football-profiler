@@ -5,6 +5,8 @@ Deploy: streamlit run app.py  OR  push to GitHub → share.streamlit.io
 """
 
 import io
+import re
+import unicodedata
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,14 +22,22 @@ st.set_page_config(
 WY_WEIGHT = 0.70
 SI_WEIGHT = 0.30
 FINISHING = {"Buts hors penaltys / 90", "xG / 90", "Tirs / 90", "% conversion buts"}
-INVERTED  = {"Fautes / 90 (inversé)", "Buts concédés / 90 (inversé)"}
+
+# Metrics where lower raw value = better (score gets flipped after percentile rank)
+INVERTED = {
+    "Fautes / 90 (inversé)",
+    "Buts concédés / 90 (inversé)",
+}
 
 # ─── Wyscout column map ───────────────────────────────────────────────────────
+# None = no mapping available in this dataset for this metric
 WY_MAP = {
+    # Finishing
     "Buts hors penaltys / 90":            "Non-penalty goals per 90",
     "xG / 90":                            "npxG per 90",
     "Tirs / 90":                          "Shots per 90",
     "% conversion buts":                  "Goal conversion, %",
+    # Offensive
     "xA / 90":                            "xA per 90",
     "Passes clés / 90":                   "Shot assists per 90",
     "Passes décisives sur tir / 90":      "Shot assists per 90",
@@ -36,22 +46,24 @@ WY_MAP = {
     "Touches dans la surface / 90":       "Touches in box per 90",
     "Passes reçues / 90":                 "Received_Passes",
     "% dribbles réussis":                 "Successful dribbles, %",
-    "Dribbles / 90":                      None,
+    "Dribbles / 90":                      "Accelerations per 90",    # proxy: acceleration ≈ dribble attempt
     "Centres / 90":                       "Crosses per 90",
     "% centres précis":                   "Accurate crosses, %",
-    "Centres profonds / 90":              None,
-    "Passes vers le dernier tiers / 90":  None,
-    "Passes vers l'avant / 90":           None,
+    "Centres profonds / 90":              None,                       # no deep-cross col in Wyscout
+    "Passes vers le dernier tiers / 90":  "Progressive passes per 90",# proxy: progressive pass enters final 3rd
+    "Passes vers l'avant / 90":           "Passes per 90",            # proxy: pass volume (different from prog.)
     "Passes / 90":                        "Passes per 90",
     "% passes précises":                  "Accurate passes, %",
     "% passes longues précises":          "Accurate long passes, %",
     "% passes courtes/moyennes précises": "Accurate short / medium passes, %",
     "Passes intelligentes / 90":          "Smart passes per 90",
-    "Longueur moyenne de passe (m)":      None,
-    "% passes progressives précises":     None,
+    "% passes progressives précises":     "Accurate long passes, %",  # proxy: long-pass accuracy ≈ prog-pass accuracy
+    "Passes longues reçues / 90":         "Received_Passes",          # proxy: total received passes
+    # Aerial
     "Duels aériens / 90":                 "Aerial duels won per 90",
     "% duels aériens gagnés":             "Aerial duels won, %",
-    "Duels défensifs / 90":               None,
+    # Defensive
+    "Duels défensifs / 90":               None,                       # no raw def-duel count in Wyscout
     "% duels défensifs gagnés":           "Defensive duels won, %",
     "Interceptions / 90":                 "PAdj Interceptions",
     "Actions défensives réussies / 90":   "Successful defensive actions per 90",
@@ -59,7 +71,7 @@ WY_MAP = {
     "Tirs contrés / 90":                  "Shots blocked per 90",
     "Fautes subies / 90":                 "Fouls suffered per 90",
     "Fautes / 90 (inversé)":              "Fouls per 90",
-    "Passes longues reçues / 90":         None,
+    # Goalkeeper
     "% arrêts (Save rate)":               "Save rate, %",
     "Buts prévenus / 90":                 "Prevented goals per 90",
     "Tirs encaissés / 90":                "Shots against per 90",
@@ -67,16 +79,545 @@ WY_MAP = {
     "Sorties / 90":                       "Exits per 90",
 }
 
+# ─── Position mapping ─────────────────────────────────────────────────────────
+# Wyscout: primary position code → position group
+_WY_POS = {
+    "CF": "Forwards", "RWF": "Forwards", "LWF": "Forwards",
+    "AMF": "Forwards",                                          # attacking mid = forward context
+    "RW": "Wide Players", "LW": "Wide Players",
+    "RWB": "Wide Players", "LWB": "Wide Players",
+    "RB": "Wide Players", "LB": "Wide Players",
+    "CMF": "Midfielders", "RCMF": "Midfielders", "LCMF": "Midfielders",
+    "RCMF3": "Midfielders", "LCMF3": "Midfielders",
+    "DMF": "Midfielders", "RDMF": "Midfielders", "LDMF": "Midfielders",
+    "CB": "Centre Backs", "RCB": "Centre Backs", "LCB": "Centre Backs",
+    "RCB3": "Centre Backs", "LCB3": "Centre Backs",
+    "GK": "Goalkeepers",
+}
+
+# SICS Ruolo dettagliato → position group (takes priority over Ruolo)
+_SI_DETAILED = {
+    "Quinto destro": "Wide Players", "Quinto sinistro": "Wide Players",
+    "Terzino destro": "Wide Players", "Terzino sinistro": "Wide Players",
+    "Esterno alto destro": "Wide Players", "Esterno alto sinistro": "Wide Players",
+    "Ala destra": "Wide Players", "Ala sinistra": "Wide Players",
+    "Difensore centrale": "Centre Backs",
+    "Libero": "Centre Backs",
+    "Mediano": "Midfielders", "Mezzala": "Midfielders",
+    "Regista": "Midfielders", "Trequartista": "Midfielders",
+    "Centravanti": "Forwards", "Seconda punta": "Forwards",
+    "Portiere": "Goalkeepers",
+}
+_SI_RUOLO = {
+    "Attaccante": "Forwards",
+    "Centrocampista": "Midfielders",
+    "Difensore": "Centre Backs",
+    "Portiere": "Goalkeepers",
+}
+
+POSITION_GROUPS = ["Forwards", "Wide Players", "Midfielders", "Goalkeepers", "Centre Backs"]
+
+
+def wy_position_group(pos_str: str) -> str:
+    """Parse Wyscout Position string (may be comma-separated) → position group."""
+    if not isinstance(pos_str, str):
+        return "Unknown"
+    primary = pos_str.split(",")[0].strip()
+    return _WY_POS.get(primary, "Unknown")
+
+
+def si_position_group(ruolo: str, ruolo_det: str) -> str:
+    """Map SICS Ruolo + Ruolo dettagliato → position group."""
+    if isinstance(ruolo_det, str) and ruolo_det in _SI_DETAILED:
+        return _SI_DETAILED[ruolo_det]
+    if isinstance(ruolo, str) and ruolo in _SI_RUOLO:
+        return _SI_RUOLO[ruolo]
+    return "Unknown"
+
+
+# ─── Name / age helpers ───────────────────────────────────────────────────────
+def _norm(name: str) -> str:
+    """Uppercase ASCII, strip accents and punctuation."""
+    nfkd = unicodedata.normalize("NFKD", str(name))
+    return re.sub(r"[^A-Z0-9 ]", "", nfkd.encode("ASCII", "ignore").decode()).strip()
+
+
+def _birth_year_from_nazionalita(s) -> int | None:
+    """Extract birth year from SICS Nazionalità like 'Italia (\'04)'."""
+    if pd.isna(s):
+        return None
+    m = re.search(r"\('(\d{2})\)", str(s))
+    if m:
+        y = int(m.group(1))
+        return 2000 + y if y <= 25 else 1900 + y
+    return None
+
+
+def _wy_birth_year(age) -> int | None:
+    """Estimate birth year from Wyscout Age (current season 2025-26)."""
+    try:
+        return 2025 - int(age)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wy_last_name(player: str) -> str:
+    """'A. Guerrisi' → 'GUERRISI'"""
+    parts = _norm(player).split()
+    return parts[-1] if parts else _norm(player)
+
+
+def _si_last_name(player: str) -> str:
+    """'GUERRISI ANDREA' → 'GUERRISI' (SICS: last name first)"""
+    parts = _norm(player).split()
+    return parts[0] if parts else _norm(player)
+
+
+def _si_first_initial(player: str) -> str:
+    """'GUERRISI ANDREA' → 'A'"""
+    parts = _norm(player).split()
+    return parts[1][0] if len(parts) > 1 else ""
+
+
+def _wy_first_initial(player: str) -> str:
+    """'A. Guerrisi' → 'A'"""
+    m = re.match(r"([A-Z])", _norm(player))
+    return m.group(1) if m else ""
+
+
+# ─── SICS deduplication (same player, different clubs) ───────────────────────
+def _dedup_sics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge rows for the same player appearing at multiple clubs.
+    Identifies duplicates by: normalised name + birth year.
+    Counting stats are summed; categorical fields keep first occurrence.
+    """
+    df = df.copy()
+    df["_by"] = df["Nazionalità"].apply(_birth_year_from_nazionalita).fillna(0).astype(int)
+    df["_nn"] = df["Giocatori"].apply(_norm)
+    df["_key"] = df["_nn"] + "_" + df["_by"].astype(str)
+
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    str_cols = [c for c in df.columns if c not in num_cols and not c.startswith("_")]
+
+    agg: dict = {c: "sum" for c in num_cols}
+    for c in str_cols:
+        agg[c] = "first"
+    # For team: show both if different
+    agg["Squadra"] = lambda x: " / ".join(sorted(set(x.dropna().astype(str))))
+
+    deduped = df.groupby("_key", sort=False).agg(agg).reset_index(drop=True)
+    # Restore clean player name (first occurrence)
+    name_map = df.groupby("_key")["Giocatori"].first()
+    deduped["Giocatori"] = deduped.apply(
+        lambda r: name_map.get(r.name, r["Giocatori"]), axis=1
+    )
+    deduped["_by"] = df.groupby("_key")["_by"].first().values
+    return deduped
+
+
+# ─── Data loading ─────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = [c.replace("\n", "_").strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    df["_position_group"] = df["Position"].apply(wy_position_group)
+    df["_birth_year"] = df["Age"].apply(_wy_birth_year)
+    df["_last_name"] = df["Player"].apply(_wy_last_name)
+    df["_first_initial"] = df["Player"].apply(_wy_first_initial)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def process_sics(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_csv(io.BytesIO(file_bytes))
+
+    # 1 — Dedup players across clubs
+    raw = _dedup_sics(raw)
+
+    minutes = raw["Minuti Giocati"].fillna(0)
+    p90 = minutes.replace(0, np.nan) / 90
+
+    def rat(num, den):
+        return (num.fillna(0) / den.fillna(0).replace(0, np.nan)).fillna(0)
+
+    # 2 — Compute per-90 raw values
+    computed = {
+        "Buts hors penaltys / 90":            (raw["Gol"].fillna(0) - raw["Gol su Rigore"].fillna(0)) / p90,
+        "xG / 90":                             raw["xG"].fillna(0) / p90,
+        "Tirs / 90":                           raw["Tiri"].fillna(0) / p90,
+        "% conversion buts":                   rat(raw["Gol"].fillna(0), raw["Tiri"].fillna(0)),
+        "xA / 90":                             raw["xA"].fillna(0) / p90,
+        "Passes clés / 90":                    raw["Passaggi Chiave"].fillna(0) / p90,
+        "Passes décisives sur tir / 90":       raw["Assist"].fillna(0) / p90,
+        "Courses progressives / 90":           raw["xT da conduzioni"].fillna(0) / p90,
+        "Passes progressives / 90":            raw["xT da passaggi"].fillna(0) / p90,
+        "Passes vers le dernier tiers / 90":   raw["Passaggi Chiave"].fillna(0) / p90,  # proxy: key passes reach final 3rd
+        "Passes vers l'avant / 90":            raw["Passaggi in Area"].fillna(0) / p90,
+        "Touches dans la surface / 90":        raw["Tocchi in area avversaria"].fillna(0) / p90,
+        "Passes reçues / 90":                  raw["Passaggi Ricevuti"].fillna(0) / p90,
+        "Passes longues reçues / 90":          raw["Passaggi Chiave Ricevuti"].fillna(0) / p90,  # proxy: key passes received
+        "Dribbles / 90":                       raw["Dribbling"].fillna(0) / p90,
+        "% dribbles réussis":                  rat(raw["Dribbling Positivo"].fillna(0), raw["Dribbling"].fillna(0)),
+        "Centres / 90":                        raw["Palle Laterali"].fillna(0) / p90,
+        "% centres précis":                    rat(raw["Cross Riusciti"].fillna(0), raw["Cross"].fillna(0)),
+        "Centres profonds / 90":               raw["Early Cross"].fillna(0) / p90,
+        "Passes / 90":                         raw["Passaggi"].fillna(0) / p90,
+        "% passes précises":                   rat(raw["Passaggi Riusciti"].fillna(0), raw["Passaggi"].fillna(0)),
+        "% passes longues précises":           rat(raw["Lanci Positivi"].fillna(0), raw["Lanci"].fillna(0)),
+        "% passes courtes/moyennes précises":  rat(raw["Passaggi Riusciti"].fillna(0), raw["Passaggi"].fillna(0)),
+        "% passes progressives précises":      rat(raw["xT da passaggi"].fillna(0),   # proxy: xT per pass attempt
+                                                   raw["Passaggi"].fillna(0)),
+        "Duels aériens / 90":                  raw["Duelli Aerei"].fillna(0) / p90,
+        "% duels aériens gagnés":              rat(raw["Duelli Aerei Vinti"].fillna(0), raw["Duelli Aerei"].fillna(0)),
+        "Duels défensifs / 90":                raw["Duelli Difensivi"].fillna(0) / p90,
+        "% duels défensifs gagnés":            rat(raw["Duelli Difensivi Vinti"].fillna(0), raw["Duelli Difensivi"].fillna(0)),
+        "Interceptions / 90":                  raw["Palle Recuperate"].fillna(0) / p90,
+        # Improved: ball recoveries in opponent's half (pressing actions) — was Interventi Positivi (sparse)
+        "Actions défensives réussies / 90":    raw["Palle Recuperate Meta Campo Avversaria"].fillna(0) / p90,
+        "Actions offensives réussies / 90":    raw["Dribbling Positivo"].fillna(0) / p90,
+        "Fautes subies / 90":                  raw["Falli Subiti"].fillna(0) / p90,
+        "Fautes / 90 (inversé)":               raw["Falli Fatti"].fillna(0) / p90,
+        "% arrêts (Save rate)":                rat(raw["Parate"].fillna(0), raw["Tiri in Porta Subiti"].fillna(0)),
+        "Buts prévenus / 90":                  raw["GK Goals Prevented"].fillna(0) / p90,
+        "Tirs encaissés / 90":                 raw["Tiri in Porta Subiti"].fillna(0) / p90,
+        "Buts concédés / 90 (inversé)":        raw["Gol Subiti dal Portiere"].fillna(0) / p90,
+        "Sorties / 90":                        raw["Uscite"].fillna(0) / p90,
+    }
+
+    # 3 — Percentile rank within this dataset
+    ranked = {}
+    for metric, series in computed.items():
+        pct = series.rank(pct=True, na_option="bottom")
+        if metric in INVERTED:
+            pct = 1 - pct
+        ranked[metric] = pct.values
+
+    result = pd.DataFrame(ranked)
+    result["_player"]         = raw["Giocatori"].values
+    result["_team"]           = raw["Squadra"].values
+    result["_minutes"]        = minutes.values
+    result["_position_group"] = raw.apply(
+        lambda r: si_position_group(r.get("Ruolo", ""), r.get("Ruolo dettagliato", "")), axis=1
+    )
+    result["_birth_year"]     = raw["_by"].values if "_by" in raw.columns else None
+    result["_last_name"]      = raw["Giocatori"].apply(_si_last_name)
+    result["_first_initial"]  = raw["Giocatori"].apply(_si_first_initial)
+    result.set_index("_player", inplace=True)
+    return result
+
+
+# ─── Player master list (Wyscout is canonical; SICS enriches) ─────────────────
+def merge_players(wy_df: pd.DataFrame | None, si_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Build deduplicated master player list.
+    Matching: last name + first initial + birth year (±1 yr tolerance).
+    """
+    rows = []
+    seen_si: set[str] = set()
+
+    # Build SICS lookup: (last_name, first_initial, birth_year) → si_index_name
+    si_lookup: dict[tuple, str] = {}
+    if si_df is not None:
+        for si_name in si_df.index:
+            ln  = si_df.loc[si_name, "_last_name"] if "_last_name" in si_df.columns else _si_last_name(si_name)
+            fi  = si_df.loc[si_name, "_first_initial"] if "_first_initial" in si_df.columns else _si_first_initial(si_name)
+            by  = si_df.loc[si_name, "_birth_year"] if "_birth_year" in si_df.columns else None
+            by  = int(by) if by and not pd.isna(by) else 0
+            si_lookup[(ln, fi, by)] = si_name
+
+    def _find_si(last: str, fi: str, by: int | None) -> str | None:
+        by = int(by) if by and not pd.isna(by) else 0
+        # Exact match first
+        if (last, fi, by) in si_lookup:
+            return si_lookup[(last, fi, by)]
+        # ±1 year tolerance
+        for delta in (-1, 1):
+            key = (last, fi, by + delta)
+            if key in si_lookup:
+                return si_lookup[key]
+        # Last name + initial only (no birth year in one dataset)
+        if by == 0:
+            candidates = [v for (l, f, _), v in si_lookup.items() if l == last and f == fi]
+            if len(candidates) == 1:
+                return candidates[0]
+        return None
+
+    # Process Wyscout players
+    if wy_df is not None:
+        for _, row in wy_df.iterrows():
+            last = row.get("_last_name", _wy_last_name(row["Player"]))
+            fi   = row.get("_first_initial", _wy_first_initial(row["Player"]))
+            by   = row.get("_birth_year")
+            si_name = _find_si(last, fi, by)
+            if si_name:
+                seen_si.add(si_name)
+                si_mins = si_df.loc[si_name, "_minutes"] if si_df is not None else None
+                team    = si_df.loc[si_name, "_team"]    if si_df is not None else row.get("Team", "")
+            else:
+                si_mins = None
+                team    = row.get("Team", "")
+
+            rows.append({
+                "Player":          row["Player"],
+                "Team":            team,
+                "Position":        row.get("Position", ""),
+                "_position_group": row.get("_position_group", "Unknown"),
+                "_birth_year":     by,
+                "Minutes":         si_mins,
+                "_si":             si_name,
+            })
+
+    # Add SICS-only players
+    if si_df is not None:
+        for si_name in si_df.index:
+            if si_name in seen_si:
+                continue
+            rows.append({
+                "Player":          si_name,
+                "Team":            si_df.loc[si_name, "_team"],
+                "Position":        si_df.loc[si_name, "_position_group"],
+                "_position_group": si_df.loc[si_name, "_position_group"],
+                "_birth_year":     si_df.loc[si_name, "_birth_year"] if "_birth_year" in si_df.columns else None,
+                "Minutes":         si_df.loc[si_name, "_minutes"],
+                "_si":             si_name,
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ─── Scoring ──────────────────────────────────────────────────────────────────
+def score_one(wy_row, si_row, metrics, no_finishing=False):
+    """
+    Returns (wy_score, si_score, global_score, coverage_pct).
+    Scores are in [0,1]. coverage_pct = % of total weight backed by real data.
+    """
+    wy_num = wy_den = si_num = si_den = 0.0
+    covered_w = total_w = 0.0
+
+    for metric, weight in metrics:
+        if no_finishing and metric in FINISHING:
+            continue
+        total_w += weight
+
+        wy_col = WY_MAP.get(metric)
+        got_wy = got_si = False
+
+        if wy_col and wy_row is not None and wy_col in wy_row.index:
+            val = wy_row[wy_col]
+            if pd.notna(val):
+                v = float(val)
+                if metric in INVERTED:
+                    v = 1 - v
+                wy_num += v * weight
+                wy_den += weight
+                got_wy = True
+
+        if si_row is not None and metric in si_row.index:
+            val = si_row[metric]
+            if pd.notna(val):
+                si_num += float(val) * weight
+                si_den += weight
+                got_si = True
+
+        if got_wy or got_si:
+            covered_w += weight
+
+    wy_s = wy_num / wy_den if wy_den > 0 else None
+    si_s = si_num / si_den if si_den > 0 else None
+    coverage = covered_w / total_w if total_w > 0 else 0.0
+
+    if wy_s is None and si_s is None:
+        return None, None, None, coverage
+
+    if wy_s is not None and si_s is not None:
+        gl = WY_WEIGHT * wy_s + SI_WEIGHT * si_s
+    else:
+        gl = wy_s if wy_s is not None else si_s
+
+    return wy_s, si_s, gl, coverage
+
+
+def _get_si_row(player_name, si_df, master):
+    """Resolve SICS row for a player via master list."""
+    if si_df is None:
+        return None
+    if player_name in si_df.index:
+        return si_df.loc[player_name]
+    if master is not None:
+        pm = master[master["Player"] == player_name]
+        if not pm.empty:
+            si_name = pm.iloc[0].get("_si")
+            if si_name and pd.notna(si_name) and si_name in si_df.index:
+                return si_df.loc[si_name]
+    return None
+
+
+def build_export(master, wy_df, si_df):
+    """
+    Build a wide CSV with one row per player containing:
+    - identity columns (Player, Team, Position, Birth Year, Minutes)
+    - global score for every profile
+    - raw percentile score for every metric (WY and SI separately)
+    Suitable for feeding an AI to suggest profiles to monitor.
+    """
+    # Collect all unique metrics across all profiles
+    all_metrics = []
+    seen = set()
+    for p in PROFILES.values():
+        for m, _ in p["metrics"]:
+            if m not in seen:
+                all_metrics.append(m)
+                seen.add(m)
+
+    rows = []
+    for _, player in master.iterrows():
+        wy_row = None
+        if wy_df is not None:
+            mask = wy_df["Player"] == player["Player"]
+            if mask.any():
+                wy_row = wy_df[mask].iloc[0]
+        si_row = _get_si_row(player["Player"], si_df, master)
+
+        row = {
+            "Player":      player["Player"],
+            "Team":        player["Team"],
+            "Position":    player.get("_position_group", ""),
+            "Birth Year":  player.get("_birth_year", ""),
+            "Minutes":     player.get("Minutes", ""),
+        }
+
+        # Profile scores (with and without finishing)
+        for pname, pdata in PROFILES.items():
+            _, _, gl, _ = score_one(wy_row, si_row, pdata["metrics"])
+            _, _, gl_nf, _ = score_one(wy_row, si_row, pdata["metrics"], no_finishing=True)
+            row[f"Score: {pname}"] = round(gl * 100, 1) if gl is not None else ""
+            row[f"Score (no finishing): {pname}"] = round(gl_nf * 100, 1) if gl_nf is not None else ""
+
+        # Per-metric percentile scores
+        for metric in all_metrics:
+            wy_col = WY_MAP.get(metric)
+            v_wy = None
+            if wy_col and wy_row is not None and wy_col in wy_row.index and pd.notna(wy_row[wy_col]):
+                v_wy = float(wy_row[wy_col])
+                if metric in INVERTED:
+                    v_wy = 1 - v_wy
+            row[f"WY: {metric}"] = round(v_wy * 100, 1) if v_wy is not None else ""
+
+            v_si = None
+            if si_row is not None and metric in si_row.index and pd.notna(si_row[metric]):
+                v_si = float(si_row[metric])
+            row[f"SI: {metric}"] = round(v_si * 100, 1) if v_si is not None else ""
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
+                      min_minutes=0, position_group=None):
+    metrics = PROFILES[profile_name]["metrics"]
+    rows = []
+    for _, p in master.iterrows():
+        # Position filter
+        if position_group and p.get("_position_group") not in (position_group, "Unknown"):
+            continue
+        mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
+        if mins < min_minutes:
+            continue
+
+        wy_row = None
+        if wy_df is not None:
+            mask = wy_df["Player"] == p["Player"]
+            if mask.any():
+                wy_row = wy_df[mask].iloc[0]
+
+        si_row = _get_si_row(p["Player"], si_df, master)
+
+        wy_s, si_s, gl, cov = score_one(wy_row, si_row, metrics, no_finishing)
+        if gl is None:
+            continue
+
+        rows.append({
+            "Player":   p["Player"],
+            "Team":     p["Team"],
+            "Pos":      p.get("_position_group", p.get("Position", "")),
+            "Mins":     int(mins) if mins else "—",
+            "Global":   round(gl * 100, 1),
+            "Wyscout":  round(wy_s * 100, 1) if wy_s is not None else None,
+            "SICS":     round(si_s * 100, 1) if si_s is not None else None,
+            "Data %":   f"{cov*100:.0f}%",
+        })
+
+    df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
+    df.index += 1
+    return df
+
+
+# ─── Radar chart ──────────────────────────────────────────────────────────────
+def make_radar(player_name, profile_name, wy_df, si_df, master, no_finishing=False):
+    metrics = PROFILES[profile_name]["metrics"]
+    if no_finishing:
+        metrics = [(m, w) for m, w in metrics if m not in FINISHING]
+
+    wy_row = None
+    if wy_df is not None:
+        mask = wy_df["Player"] == player_name
+        if mask.any():
+            wy_row = wy_df[mask].iloc[0]
+    si_row = _get_si_row(player_name, si_df, master)
+
+    labels, wy_vals, si_vals = [], [], []
+    for metric, _ in metrics:
+        short = (metric.replace(" / 90", "/90").replace("% ", "%")
+                       .replace("Passes ", "Pass ").replace("Actions ", "Act "))
+        labels.append(short)
+
+        wy_col = WY_MAP.get(metric)
+        v_wy = 0.0
+        if wy_col and wy_row is not None and wy_col in wy_row.index and pd.notna(wy_row[wy_col]):
+            v_wy = float(wy_row[wy_col])
+            if metric in INVERTED:
+                v_wy = 1 - v_wy
+        wy_vals.append(round(v_wy * 100, 1))
+
+        v_si = 0.0
+        if si_row is not None and metric in si_row.index and pd.notna(si_row[metric]):
+            v_si = float(si_row[metric])
+        si_vals.append(round(v_si * 100, 1))
+
+    cats = labels + [labels[0]]
+    fig = go.Figure()
+    if any(v > 0 for v in wy_vals):
+        fig.add_trace(go.Scatterpolar(
+            r=wy_vals + [wy_vals[0]], theta=cats, fill="toself", name="Wyscout",
+            line=dict(color="#1f77b4", width=2), fillcolor="rgba(31,119,180,0.15)",
+        ))
+    if any(v > 0 for v in si_vals):
+        fig.add_trace(go.Scatterpolar(
+            r=si_vals + [si_vals[0]], theta=cats, fill="toself", name="SICS",
+            line=dict(color="#ff7f0e", width=2), fillcolor="rgba(255,127,14,0.15)",
+        ))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9))),
+        legend=dict(orientation="h", y=-0.15),
+        height=460, margin=dict(l=55, r=55, t=50, b=55),
+        title=dict(text=f"<b>{player_name}</b>  ·  {profile_name}", x=0.5),
+    )
+    return fig
+
+
 # ─── Profiles ─────────────────────────────────────────────────────────────────
 PROFILES = {
     "Target Man #9": {
         "group": "Forwards",
         "metrics": [
             ("Duels aériens / 90", 20), ("% duels aériens gagnés", 15),
-            ("Passes longues reçues / 90", 10), ("Passes vers le dernier tiers / 90", 10),
+            ("Passes vers le dernier tiers / 90", 10),
             ("Fautes subies / 90", 10), ("xG / 90", 10), ("Tirs / 90", 5),
             ("Buts hors penaltys / 90", 5), ("Touches dans la surface / 90", 5),
-            ("Passes reçues / 90", 10),
+            ("Passes reçues / 90", 20),
         ],
     },
     "Poacher": {
@@ -172,18 +713,17 @@ PROFILES = {
         "metrics": [
             ("Interceptions / 90", 20), ("Duels défensifs / 90", 15),
             ("% duels défensifs gagnés", 10), ("Actions défensives réussies / 90", 10),
-            ("% passes précises", 10), ("Passes vers l'avant / 90", 10),
+            ("% passes précises", 15), ("Passes vers l'avant / 90", 10),
             ("Passes vers le dernier tiers / 90", 10), ("Passes progressives / 90", 10),
-            ("Longueur moyenne de passe (m)", 5),
         ],
     },
     "Deep-Lying Playmaker": {
         "group": "Midfielders",
         "metrics": [
-            ("Passes progressives / 90", 20), ("% passes progressives précises", 15),
-            ("Passes reçues / 90", 10), ("% passes longues précises", 10),
+            ("Passes progressives / 90", 25),
+            ("Passes reçues / 90", 10), ("% passes longues précises", 15),
             ("Passes vers l'avant / 90", 10), ("Passes / 90", 10),
-            ("Passes vers le dernier tiers / 90", 10), ("Interceptions / 90", 5),
+            ("Passes vers le dernier tiers / 90", 15), ("Interceptions / 90", 5),
             ("Duels défensifs / 90", 5), ("% duels aériens gagnés", 5),
         ],
     },
@@ -213,7 +753,7 @@ PROFILES = {
             ("Tirs encaissés / 90", 10), ("% duels aériens gagnés", 10),
             ("% passes longues précises", 10), ("Buts concédés / 90 (inversé)", 5),
             ("Sorties / 90", 5), ("Duels aériens / 90", 5),
-            ("% passes précises", 5), ("Longueur moyenne de passe (m)", 5),
+            ("% passes précises", 10),
         ],
     },
     "Sweeper Keeper": {
@@ -229,9 +769,9 @@ PROFILES = {
     "Build-Up Keeper": {
         "group": "Goalkeepers",
         "metrics": [
-            ("% passes précises", 20), ("% passes longues précises", 15),
-            ("Passes progressives / 90", 15), ("Passes vers l'avant / 90", 10),
-            ("Passes vers le dernier tiers / 90", 10), ("Longueur moyenne de passe (m)", 10),
+            ("% passes précises", 20), ("% passes longues précises", 20),
+            ("Passes progressives / 90", 20), ("Passes vers l'avant / 90", 10),
+            ("Passes vers le dernier tiers / 90", 10),
             ("Passes / 90", 5), ("% arrêts (Save rate)", 5),
             ("Buts prévenus / 90", 5), ("Sorties / 90", 5),
         ],
@@ -239,11 +779,11 @@ PROFILES = {
     "Ball-Playing CB": {
         "group": "Centre Backs",
         "metrics": [
-            ("Passes progressives / 90", 20), ("% passes progressives précises", 15),
-            ("Passes vers l'avant / 90", 10), ("% passes précises", 10),
+            ("Passes progressives / 90", 25),
+            ("Passes vers l'avant / 90", 20), ("% passes précises", 10),
             ("% passes longues précises", 10), ("Passes / 90", 10),
-            ("Interceptions / 90", 10), ("Longueur moyenne de passe (m)", 5),
-            ("% duels défensifs gagnés", 5), ("% duels aériens gagnés", 5),
+            ("Interceptions / 90", 10),
+            ("% duels défensifs gagnés", 10), ("% duels aériens gagnés", 5),
         ],
     },
     "Combative CB / Stopper": {
@@ -277,262 +817,6 @@ PROFILES = {
     },
 }
 
-POSITION_GROUPS = ["Forwards", "Wide Players", "Midfielders", "Goalkeepers", "Centre Backs"]
-
-# ─── Data Processing ──────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    df.columns = [c.replace("\n", "_").strip() for c in df.columns]
-    # Drop unnamed index column if present
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def process_sics(file_bytes: bytes) -> pd.DataFrame:
-    """Load SICS, compute per-90, percentile-rank. Returns wide DataFrame keyed by player name."""
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    minutes = df["Minuti Giocati"].fillna(0)
-    p90 = minutes.replace(0, np.nan) / 90
-
-    def r(num, den):
-        return (num.fillna(0) / den.fillna(0).replace(0, np.nan)).fillna(0)
-
-    raw = {
-        "Buts hors penaltys / 90":            (df["Gol"].fillna(0) - df["Gol su Rigore"].fillna(0)) / p90,
-        "xG / 90":                             df["xG"].fillna(0) / p90,
-        "Tirs / 90":                           df["Tiri"].fillna(0) / p90,
-        "% conversion buts":                   r(df["Gol"].fillna(0), df["Tiri"].fillna(0)),
-        "xA / 90":                             df["xA"].fillna(0) / p90,
-        "Passes clés / 90":                    df["Passaggi Chiave"].fillna(0) / p90,
-        "Passes décisives sur tir / 90":       df["Assist"].fillna(0) / p90,
-        "Courses progressives / 90":           df["xT da conduzioni"].fillna(0) / p90,
-        "Passes progressives / 90":            df["xT da passaggi"].fillna(0) / p90,
-        "Touches dans la surface / 90":        df["Tocchi in area avversaria"].fillna(0) / p90,
-        "Passes reçues / 90":                  df["Passaggi Ricevuti"].fillna(0) / p90,
-        "Dribbles / 90":                       df["Dribbling"].fillna(0) / p90,
-        "% dribbles réussis":                  r(df["Dribbling Positivo"].fillna(0), df["Dribbling"].fillna(0)),
-        "Centres / 90":                        df["Palle Laterali"].fillna(0) / p90,
-        "% centres précis":                    r(df["Cross Riusciti"].fillna(0), df["Cross"].fillna(0)),
-        "Centres profonds / 90":               df["Early Cross"].fillna(0) / p90,
-        "Passes vers le dernier tiers / 90":   df["Third Pass"].fillna(0) / p90,
-        "Passes vers l'avant / 90":            df["Passaggi in Area"].fillna(0) / p90,
-        "Passes / 90":                         df["Passaggi"].fillna(0) / p90,
-        "% passes précises":                   r(df["Passaggi Riusciti"].fillna(0), df["Passaggi"].fillna(0)),
-        "% passes longues précises":           r(df["Lanci Positivi"].fillna(0), df["Lanci"].fillna(0)),
-        "% passes courtes/moyennes précises":  r(df["Passaggi Riusciti"].fillna(0), df["Passaggi"].fillna(0)),
-        "Duels aériens / 90":                  df["Duelli Aerei"].fillna(0) / p90,
-        "% duels aériens gagnés":              r(df["Duelli Aerei Vinti"].fillna(0), df["Duelli Aerei"].fillna(0)),
-        "Duels défensifs / 90":                df["Duelli Difensivi"].fillna(0) / p90,
-        "% duels défensifs gagnés":            r(df["Duelli Difensivi Vinti"].fillna(0), df["Duelli Difensivi"].fillna(0)),
-        "Interceptions / 90":                  df["Palle Recuperate"].fillna(0) / p90,
-        "Actions défensives réussies / 90":    df["Interventi Positivi"].fillna(0) / p90,
-        "Actions offensives réussies / 90":    df["Dribbling Positivo"].fillna(0) / p90,
-        "Fautes subies / 90":                  df["Falli Subiti"].fillna(0) / p90,
-        "Fautes / 90 (inversé)":               df["Falli Fatti"].fillna(0) / p90,
-        "% arrêts (Save rate)":                r(df["Parate"].fillna(0), df["Tiri in Porta Subiti"].fillna(0)),
-        "Buts prévenus / 90":                  df["GK Goals Prevented"].fillna(0) / p90,
-        "Tirs encaissés / 90":                 df["Tiri in Porta Subiti"].fillna(0) / p90,
-        "Buts concédés / 90 (inversé)":        df["Gol Subiti dal Portiere"].fillna(0) / p90,
-        "Sorties / 90":                        df["Uscite"].fillna(0) / p90,
-    }
-
-    ranked = {}
-    for metric, series in raw.items():
-        pct = series.rank(pct=True, na_option="bottom")
-        if metric in INVERTED:
-            pct = 1 - pct
-        ranked[metric] = pct.values
-
-    result = pd.DataFrame(ranked)
-    result["_player"]   = df["Giocatori"].values
-    result["_team"]     = df["Squadra"].values
-    result["_minutes"]  = minutes.values
-    result["_position"] = df["Ruolo"].values
-    result.set_index("_player", inplace=True)
-    return result
-
-
-def merge_players(wy_df: pd.DataFrame, si_df: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    Build master player list from Wyscout.
-    SICS enriches via last-name matching.
-    Returns DataFrame with columns: Player, Team, Position, Minutes, _wy_idx, _si_name
-    """
-    rows = []
-    si_index = {}
-    if si_df is not None:
-        # Build last-name lookup from SICS: last-name → list of SICS player names
-        for si_name in si_df.index:
-            last = si_name.split()[-1].upper() if si_name.split() else si_name.upper()
-            si_index.setdefault(last, []).append(si_name)
-
-    seen_si = set()
-    for _, row in wy_df.iterrows():
-        name = row["Player"]
-        # Try to match Wyscout player to SICS by last name
-        parts = name.replace(".", "").split()
-        last_wy = parts[-1].upper() if parts else name.upper()
-        candidates = si_index.get(last_wy, [])
-        si_name = candidates[0] if len(candidates) == 1 else None
-        if si_name:
-            seen_si.add(si_name)
-
-        rows.append({
-            "Player":   name,
-            "Team":     row.get("Team", ""),
-            "Position": row.get("Position", ""),
-            "Minutes":  si_df.loc[si_name, "_minutes"] if si_name and si_df is not None else None,
-            "_si":      si_name,
-        })
-
-    # Add SICS-only players (not matched to any Wyscout player)
-    if si_df is not None:
-        for si_name in si_df.index:
-            if si_name not in seen_si:
-                rows.append({
-                    "Player":   si_name,
-                    "Team":     si_df.loc[si_name, "_team"],
-                    "Position": si_df.loc[si_name, "_position"],
-                    "Minutes":  si_df.loc[si_name, "_minutes"],
-                    "_si":      si_name,
-                })
-
-    return pd.DataFrame(rows)
-
-
-# ─── Scoring ──────────────────────────────────────────────────────────────────
-def get_player_row(player_name: str, wy_df, si_df):
-    """Return (wy_row, si_row) for a player. Either can be None."""
-    wy_row = None
-    si_row = None
-    if wy_df is not None and "Player" in wy_df.columns:
-        mask = wy_df["Player"] == player_name
-        if mask.any():
-            wy_row = wy_df[mask].iloc[0]
-    if si_df is not None:
-        # try direct name, then via master list
-        if player_name in si_df.index:
-            si_row = si_df.loc[player_name]
-    return wy_row, si_row
-
-
-def score_one(wy_row, si_row, metrics, no_finishing=False):
-    """Returns (wy_score, si_score, global_score) each in [0,1] or None."""
-    wy_num = wy_den = si_num = si_den = 0.0
-    for metric, weight in metrics:
-        if no_finishing and metric in FINISHING:
-            continue
-        wy_col = WY_MAP.get(metric)
-        if wy_col and wy_row is not None and wy_col in wy_row.index:
-            val = wy_row[wy_col]
-            if pd.notna(val):
-                if metric in INVERTED:
-                    val = 1 - float(val)
-                wy_num += float(val) * weight
-                wy_den += weight
-        if si_row is not None and metric in si_row.index:
-            val = si_row[metric]
-            if pd.notna(val):
-                si_num += float(val) * weight
-                si_den += weight
-
-    wy_s = wy_num / wy_den if wy_den > 0 else None
-    si_s = si_num / si_den if si_den > 0 else None
-    if wy_s is None and si_s is None:
-        return None, None, None
-    if wy_s is not None and si_s is not None:
-        gl = WY_WEIGHT * wy_s + SI_WEIGHT * si_s
-    else:
-        gl = wy_s if wy_s is not None else si_s
-    return wy_s, si_s, gl
-
-
-def score_all_players(master: pd.DataFrame, wy_df, si_df, profile_name: str,
-                      no_finishing=False, min_minutes=0) -> pd.DataFrame:
-    metrics = PROFILES[profile_name]["metrics"]
-    rows = []
-    for _, p in master.iterrows():
-        mins = p["Minutes"] if pd.notna(p.get("Minutes", None)) else 0
-        if mins < min_minutes:
-            continue
-        wy_row, si_row = get_player_row(p["Player"], wy_df, si_df)
-        # For SICS-only players, look up via _si key
-        if si_row is None and si_df is not None and pd.notna(p.get("_si")):
-            si_name = p["_si"]
-            if si_name in si_df.index:
-                si_row = si_df.loc[si_name]
-        wy_s, si_s, gl = score_one(wy_row, si_row, metrics, no_finishing)
-        if gl is None:
-            continue
-        rows.append({
-            "Player":  p["Player"],
-            "Team":    p["Team"],
-            "Pos":     p["Position"],
-            "Mins":    int(mins) if mins else "—",
-            "Global":  round(gl * 100, 1),
-            "Wyscout": round(wy_s * 100, 1) if wy_s is not None else None,
-            "SICS":    round(si_s * 100, 1) if si_s is not None else None,
-        })
-    df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
-    df.index += 1
-    return df
-
-
-# ─── Radar Chart ──────────────────────────────────────────────────────────────
-def make_radar(player_name, profile_name, wy_df, si_df, master, no_finishing=False):
-    metrics = PROFILES[profile_name]["metrics"]
-    if no_finishing:
-        metrics = [(m, w) for m, w in metrics if m not in FINISHING]
-
-    wy_row, si_row = get_player_row(player_name, wy_df, si_df)
-    if si_row is None and si_df is not None:
-        p_match = master[master["Player"] == player_name]
-        if not p_match.empty and pd.notna(p_match.iloc[0].get("_si")):
-            si_name = p_match.iloc[0]["_si"]
-            if si_name in si_df.index:
-                si_row = si_df.loc[si_name]
-
-    labels, wy_vals, si_vals = [], [], []
-    for metric, _ in metrics:
-        short = metric.replace(" / 90", "/90").replace("% ", "%").replace("Passes ", "Pass ").replace("Actions ", "Act ")
-        labels.append(short)
-
-        wy_col = WY_MAP.get(metric)
-        v_wy = 0.0
-        if wy_col and wy_row is not None and wy_col in wy_row.index and pd.notna(wy_row[wy_col]):
-            v_wy = float(wy_row[wy_col])
-            if metric in INVERTED:
-                v_wy = 1 - v_wy
-        wy_vals.append(round(v_wy * 100, 1))
-
-        v_si = 0.0
-        if si_row is not None and metric in si_row.index and pd.notna(si_row[metric]):
-            v_si = float(si_row[metric])
-        si_vals.append(round(v_si * 100, 1))
-
-    fig = go.Figure()
-    cats = labels + [labels[0]]
-    if any(v > 0 for v in wy_vals):
-        fig.add_trace(go.Scatterpolar(
-            r=wy_vals + [wy_vals[0]], theta=cats, fill="toself", name="Wyscout",
-            line=dict(color="#1f77b4", width=2), fillcolor="rgba(31,119,180,0.15)"
-        ))
-    if any(v > 0 for v in si_vals):
-        fig.add_trace(go.Scatterpolar(
-            r=si_vals + [si_vals[0]], theta=cats, fill="toself", name="SICS",
-            line=dict(color="#ff7f0e", width=2), fillcolor="rgba(255,127,14,0.15)"
-        ))
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9))),
-        legend=dict(orientation="h", y=-0.15),
-        height=460, margin=dict(l=55, r=55, t=50, b=55),
-        title=dict(text=f"<b>{player_name}</b>  ·  {profile_name}", x=0.5),
-    )
-    return fig
-
-
 # ─── Session state init ───────────────────────────────────────────────────────
 for key, default in [("wy_bytes", None), ("si_bytes", None), ("group", None), ("min_mins", 500)]:
     if key not in st.session_state:
@@ -541,9 +825,9 @@ for key, default in [("wy_bytes", None), ("si_bytes", None), ("group", None), ("
 # ─── Derived state ────────────────────────────────────────────────────────────
 wy_df  = process_wyscout(st.session_state.wy_bytes) if st.session_state.wy_bytes else None
 si_df  = process_sics(st.session_state.si_bytes)    if st.session_state.si_bytes else None
-master = merge_players(wy_df, si_df) if wy_df is not None or si_df is not None else None
+master = merge_players(wy_df, si_df) if (wy_df is not None or si_df is not None) else None
 
-# ─── STEP 1 — Upload ─────────────────────────────────────────────────────────
+# ─── STEP 1 — Upload ──────────────────────────────────────────────────────────
 if wy_df is None:
     st.title("⚽ Football Profiler")
     st.markdown("Upload your data files to get started.")
@@ -551,14 +835,14 @@ if wy_df is None:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("1 · Wyscout CSV")
-        st.caption("Export from Wyscout — all positions, filtered as needed.")
+        st.caption("Export from Wyscout — filter position & cohort before exporting.")
         wy_file = st.file_uploader("", type="csv", key="wy_upload", label_visibility="collapsed")
         if wy_file:
             st.session_state.wy_bytes = wy_file.read()
             st.rerun()
     with col2:
         st.subheader("2 · SICS CSV  *(optional)*")
-        st.caption("SICS.tv export. Adds a 30 % weight to the global score.")
+        st.caption("SICS.tv export. Adds 30% weight to the global score.")
         si_file = st.file_uploader("", type="csv", key="si_upload", label_visibility="collapsed")
         if si_file:
             st.session_state.si_bytes = si_file.read()
@@ -580,12 +864,14 @@ if st.session_state.group is None:
     st.success(f"Data loaded — {n_wy} Wyscout players · {n_si} SICS players")
     st.markdown("### Select a position group")
     st.markdown(" ")
+    icons = {"Forwards": "⚡", "Wide Players": "↔️", "Midfielders": "🔄",
+             "Goalkeepers": "🧤", "Centre Backs": "🛡️"}
     cols = st.columns(len(POSITION_GROUPS))
-    icons = {"Forwards": "⚡", "Wide Players": "↔️", "Midfielders": "🔄", "Goalkeepers": "🧤", "Centre Backs": "🛡️"}
     for col, grp in zip(cols, POSITION_GROUPS):
         n_profiles = sum(1 for p in PROFILES.values() if p["group"] == grp)
         with col:
-            if st.button(f"{icons[grp]}\n**{grp}**\n{n_profiles} roles", use_container_width=True):
+            if st.button(f"{icons[grp]}\n**{grp}**\n{n_profiles} roles",
+                         use_container_width=True):
                 st.session_state.group = grp
                 st.rerun()
     st.stop()
@@ -594,7 +880,6 @@ if st.session_state.group is None:
 group = st.session_state.group
 profiles_in_group = [n for n, p in PROFILES.items() if p["group"] == group]
 
-# Sidebar
 with st.sidebar:
     st.markdown("### Settings")
     if st.button("← Back to positions"):
@@ -606,73 +891,90 @@ with st.sidebar:
         st.session_state.group = None
         st.rerun()
     st.markdown("---")
-    st.session_state.min_mins = st.slider("Min minutes", 100, 2000, st.session_state.min_mins, 50)
+    st.session_state.min_mins = st.slider("Min minutes", 100, 2000,
+                                           st.session_state.min_mins, 50)
+    filter_pos  = st.toggle("Filter by position group", True,
+                             help="Only show players mapped to this position group")
     no_finishing = st.toggle("Without finishing", False,
-                             help="Excludes xG, shots, goals, conversion rate from the score")
-    n_similar = st.slider("Players to show", 5, 50, 15)
+                              help="Excludes xG, shots, goals, conversion rate")
+    n_similar    = st.slider("Players to show", 5, 50, 15)
+    st.markdown("---")
+    st.markdown("**Export**")
+    if st.button("Build full export CSV", use_container_width=True):
+        export_df = build_export(master, wy_df, si_df)
+        st.session_state["export_csv"] = export_df.to_csv(index=False).encode("utf-8")
+    if "export_csv" in st.session_state:
+        st.download_button(
+            "⬇ Download CSV",
+            data=st.session_state["export_csv"],
+            file_name="profiler_export.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 st.title(f"⚽ {group}")
-suffix = " *(no finishing)*" if no_finishing else ""
 
-# Player search
-search = st.text_input("🔍 Search a player (optional — browse all roles for them)",
+pos_filter = group if filter_pos else None
+search = st.text_input("🔍 Search a player (leave empty to browse all roles)",
                        placeholder="Type a player name…")
 
-# ── Player detail view ──
+# ── Player detail view ──────────────────────────────────────────────────────
 if search.strip():
-    search_lower = search.strip().lower()
-    matched = [p for p in master["Player"].tolist() if search_lower in p.lower()] if master is not None else []
+    sl = search.strip().lower()
+    matched = [p for p in master["Player"].tolist() if sl in p.lower()] \
+              if master is not None else []
     if not matched:
         st.warning("No player found.")
     else:
         player = st.selectbox("Select player", matched)
-        wy_row, si_row = get_player_row(player, wy_df, si_df)
-        if si_row is None and si_df is not None and master is not None:
-            pm = master[master["Player"] == player]
-            if not pm.empty and pd.notna(pm.iloc[0].get("_si")):
-                si_name = pm.iloc[0]["_si"]
-                if si_name in si_df.index:
-                    si_row = si_df.loc[si_name]
+        wy_row = None
+        if wy_df is not None:
+            mask = wy_df["Player"] == player
+            if mask.any():
+                wy_row = wy_df[mask].iloc[0]
+        si_row = _get_si_row(player, si_df, master)
 
         st.markdown(f"### {player}")
-        st.markdown(f"**Scores across all {group} profiles**{suffix}")
+        st.markdown(f"**Scores across all {group} profiles**")
 
-        # Score cards for all profiles
         score_cols = st.columns(len(profiles_in_group))
         for col, pname in zip(score_cols, profiles_in_group):
-            wy_s, si_s, gl = score_one(wy_row, si_row, PROFILES[pname]["metrics"], no_finishing)
+            _, _, gl, cov = score_one(wy_row, si_row, PROFILES[pname]["metrics"], no_finishing)
             with col:
-                st.metric(pname, f"{gl*100:.0f}" if gl is not None else "—")
+                st.metric(pname,
+                          f"{gl*100:.0f}" if gl is not None else "—",
+                          delta=f"{cov*100:.0f}% data" if gl is not None else None)
 
         st.markdown("---")
-        # Radar for selected profile
         active_profile = st.selectbox("Radar profile", profiles_in_group)
+        wy_s, si_s, gl, cov = score_one(wy_row, si_row,
+                                          PROFILES[active_profile]["metrics"], no_finishing)
 
-        wy_s, si_s, gl = score_one(wy_row, si_row, PROFILES[active_profile]["metrics"], no_finishing)
-
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1: st.metric("Wyscout (70%)", f"{wy_s*100:.1f}" if wy_s is not None else "—")
         with c2: st.metric("SICS (30%)",    f"{si_s*100:.1f}" if si_s is not None else "—")
         with c3: st.metric("Global",        f"{gl*100:.1f}"   if gl   is not None else "—")
+        with c4: st.metric("Data coverage", f"{cov*100:.0f}%")
 
-        # With/without finishing comparison (always visible when finishing is ON)
         if not no_finishing:
-            wy_nf, si_nf, gl_nf = score_one(wy_row, si_row, PROFILES[active_profile]["metrics"], no_finishing=True)
-            gl_str  = f"{gl*100:.1f}"   if gl   is not None else "—"
-            gl_nf_str = f"{gl_nf*100:.1f}" if gl_nf is not None else "—"
-            delta = f"{(gl_nf - gl)*100:+.1f}" if (gl_nf is not None and gl is not None) else ""
-            st.caption(f"Without finishing → Global **{gl_nf_str}** (delta {delta})")
+            _, _, gl_nf, _ = score_one(wy_row, si_row,
+                                        PROFILES[active_profile]["metrics"], no_finishing=True)
+            if gl is not None and gl_nf is not None:
+                delta = (gl_nf - gl) * 100
+                st.caption(f"Without finishing → **{gl_nf*100:.1f}**  (delta {delta:+.1f})")
 
         col_radar, col_table = st.columns([3, 2])
         with col_radar:
-            st.plotly_chart(make_radar(player, active_profile, wy_df, si_df, master, no_finishing),
-                            use_container_width=True)
+            st.plotly_chart(
+                make_radar(player, active_profile, wy_df, si_df, master, no_finishing),
+                use_container_width=True,
+            )
         with col_table:
             st.markdown("**Metric breakdown**")
-            breakdown = []
             metrics = PROFILES[active_profile]["metrics"]
             if no_finishing:
                 metrics = [(m, w) for m, w in metrics if m not in FINISHING]
+            breakdown = []
             for m, w in metrics:
                 wy_col = WY_MAP.get(m)
                 v_wy = None
@@ -683,43 +985,52 @@ if search.strip():
                 v_si = None
                 if si_row is not None and m in si_row.index and pd.notna(si_row[m]):
                     v_si = float(si_row[m])
+                proxy_note = ""
+                if wy_col and wy_col not in (m, ""):
+                    proxy_note = "~"
                 breakdown.append({
-                    "Metric": m,
-                    "W%": w,
-                    "WY": f"{v_wy*100:.0f}" if v_wy is not None else "—",
-                    "SI": f"{v_si*100:.0f}" if v_si is not None else "—",
-                    "★": "★" if m in FINISHING else "",
+                    "Metric":  m,
+                    "W%":      w,
+                    "WY":      f"{v_wy*100:.0f}{proxy_note}" if v_wy is not None else "—",
+                    "SI":      f"{v_si*100:.0f}" if v_si is not None else "—",
+                    "★":       "★" if m in FINISHING else "",
                 })
             st.dataframe(pd.DataFrame(breakdown), hide_index=True, use_container_width=True,
-                         column_config={"W%": st.column_config.NumberColumn(width="small"),
-                                        "★": st.column_config.TextColumn(width="small")})
+                         column_config={
+                             "W%": st.column_config.NumberColumn(width="small"),
+                             "★":  st.column_config.TextColumn(width="small"),
+                         })
 
-# ── Profile tabs view ──
+# ── Profile tabs view ────────────────────────────────────────────────────────
 else:
     tabs = st.tabs([f"**{n}**" for n in profiles_in_group])
     for tab, pname in zip(tabs, profiles_in_group):
         with tab:
-            st.caption(f"Ranked by global score (Wyscout 70% + SICS 30%){suffix}")
+            st.caption(
+                f"Wyscout 70% + SICS 30%"
+                + (" · no finishing" if no_finishing else "")
+                + f" · min {st.session_state.min_mins} min"
+                + (" · position filtered" if filter_pos else "")
+            )
             scored = score_all_players(
                 master, wy_df, si_df, pname,
                 no_finishing=no_finishing,
                 min_minutes=st.session_state.min_mins,
+                position_group=pos_filter,
             )
             if scored.empty:
-                st.info("No players with enough minutes for this profile.")
+                st.info("No players found. Try lowering the minutes threshold or disabling position filter.")
                 continue
 
-            # Colour-code Global column
             def colour(val):
                 if not isinstance(val, (int, float)):
                     return ""
-                if val >= 70: return "background-color:#d4edda; color:#155724"
-                if val >= 50: return "background-color:#fff3cd; color:#856404"
-                return "background-color:#f8d7da; color:#721c24"
+                if val >= 70: return "background-color:#d4edda;color:#155724"
+                if val >= 50: return "background-color:#fff3cd;color:#856404"
+                return "background-color:#f8d7da;color:#721c24"
 
-            styled = (
-                scored[["Player", "Team", "Pos", "Mins", "Global", "Wyscout", "SICS"]]
-                .head(n_similar)
-                .style.applymap(colour, subset=["Global"])
+            display = scored[["Player", "Team", "Pos", "Mins", "Global", "Wyscout", "SICS", "Data %"]].head(n_similar)
+            st.dataframe(
+                display.style.applymap(colour, subset=["Global"]),
+                use_container_width=True,
             )
-            st.dataframe(styled, use_container_width=True)
