@@ -232,6 +232,15 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     df["_birth_year"] = df["Age"].apply(_wy_birth_year)
     df["_last_name"] = df["Player"].apply(_wy_last_name)
     df["_first_initial"] = df["Player"].apply(_wy_first_initial)
+
+    # Percentile-rank all stat columns used in WY_MAP so scores are 0–1,
+    # matching the SICS percentile format used in score_one.
+    wy_target_cols = {v for v in WY_MAP.values() if v is not None}
+    for col in wy_target_cols:
+        if col in df.columns:
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            df[col] = numeric.rank(pct=True, na_option="bottom")
+
     return df
 
 
@@ -418,9 +427,9 @@ def score_one(wy_row, si_row, metrics, no_finishing=False):
         got_wy = got_si = False
 
         if wy_col and wy_row is not None and wy_col in wy_row.index:
-            val = wy_row[wy_col]
-            if pd.notna(val):
-                v = float(val)
+            v = pd.to_numeric(wy_row[wy_col], errors="coerce")
+            if pd.notna(v):
+                v = float(v)
                 if metric in INVERTED:
                     v = 1 - v
                 wy_num += v * weight
@@ -450,6 +459,78 @@ def score_one(wy_row, si_row, metrics, no_finishing=False):
         gl = wy_s if wy_s is not None else si_s
 
     return wy_s, si_s, gl, coverage
+
+
+def _metric_vector(wy_row, si_row, metrics):
+    """Return a numpy array of combined metric scores (0–1) for a player."""
+    vec = []
+    for metric, _ in metrics:
+        wy_col = WY_MAP.get(metric)
+        v_wy = np.nan
+        if wy_col and wy_row is not None and wy_col in wy_row.index:
+            raw = pd.to_numeric(wy_row[wy_col], errors="coerce")
+            if pd.notna(raw):
+                v_wy = float(raw)
+                if metric in INVERTED:
+                    v_wy = 1 - v_wy
+        v_si = np.nan
+        if si_row is not None and metric in si_row.index:
+            raw = pd.to_numeric(si_row[metric], errors="coerce")
+            if pd.notna(raw):
+                v_si = float(raw)
+        # Combined: prefer average of both, fall back to whichever is available
+        if not np.isnan(v_wy) and not np.isnan(v_si):
+            vec.append(WY_WEIGHT * v_wy + SI_WEIGHT * v_si)
+        elif not np.isnan(v_wy):
+            vec.append(v_wy)
+        elif not np.isnan(v_si):
+            vec.append(v_si)
+        else:
+            vec.append(0.0)
+    return np.array(vec, dtype=float)
+
+
+def find_similar(player_name, profile_name, master, wy_df, si_df, n=15):
+    """Return DataFrame of most similar players to player_name under profile_name."""
+    metrics = PROFILES[profile_name]["metrics"]
+
+    wy_row = None
+    if wy_df is not None:
+        mask = wy_df["Player"] == player_name
+        if mask.any():
+            wy_row = wy_df[mask].iloc[0]
+    si_row = _get_si_row(player_name, si_df, master)
+    ref_vec = _metric_vector(wy_row, si_row, metrics)
+    ref_norm = np.linalg.norm(ref_vec)
+
+    rows = []
+    for _, p in master.iterrows():
+        if p["Player"] == player_name:
+            continue
+        pw_row = None
+        if wy_df is not None:
+            mask = wy_df["Player"] == p["Player"]
+            if mask.any():
+                pw_row = wy_df[mask].iloc[0]
+        ps_row = _get_si_row(p["Player"], si_df, master)
+        vec = _metric_vector(pw_row, ps_row, metrics)
+        norm = np.linalg.norm(vec)
+        if ref_norm > 0 and norm > 0:
+            cosine_sim = float(np.dot(ref_vec, vec) / (ref_norm * norm))
+        else:
+            cosine_sim = 0.0
+        mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
+        rows.append({
+            "Player":     p["Player"],
+            "Team":       p["Team"],
+            "Mins":       int(mins) if mins else "—",
+            "Similarity": round(cosine_sim * 100, 1),
+        })
+
+    return (pd.DataFrame(rows)
+            .sort_values("Similarity", ascending=False)
+            .head(n)
+            .reset_index(drop=True))
 
 
 def _get_si_row(player_name, si_df, master):
@@ -898,7 +979,21 @@ if st.session_state.group is None:
 
     n_wy = len(wy_df) if wy_df is not None else 0
     n_si = len(si_df) if si_df is not None else 0
-    st.success(f"Data loaded — {n_wy} Wyscout players · {n_si} SICS players")
+    n_matched = len(master[master["_si"].notna()]) if master is not None else 0
+    st.success(f"Data loaded — {n_wy} Wyscout · {n_si} SICS · **{n_matched} matched**")
+    with st.expander("🔍 Merge diagnostics", expanded=False):
+        if master is not None:
+            matched = master[master["_si"].notna()][["Player", "Team", "_si", "_birth_year"]].head(20)
+            unmatched = master[master["_si"].isna()][["Player", "Team", "_birth_year"]].head(20)
+            st.markdown(f"**Matched ({n_matched})** — first 20:")
+            st.dataframe(matched, hide_index=True, use_container_width=True)
+            st.markdown(f"**Wyscout-only (no SICS match)** — first 20:")
+            st.dataframe(unmatched, hide_index=True, use_container_width=True)
+            if wy_df is not None:
+                wy_cols_present = [c for c in WY_MAP.values() if c and c in wy_df.columns]
+                wy_cols_missing = [c for c in WY_MAP.values() if c and c not in wy_df.columns]
+                st.markdown(f"**WY_MAP columns found in CSV ({len(wy_cols_present)}):** {wy_cols_present}")
+                st.markdown(f"**WY_MAP columns missing ({len(wy_cols_missing)}):** {wy_cols_missing}")
     st.markdown("### Select a position group")
     st.markdown(" ")
     icons = {"Forwards": "⚡", "Wide Players": "↔️", "Midfielders": "🔄",
@@ -1037,6 +1132,24 @@ if search.strip():
                              "W%": st.column_config.NumberColumn(width="small"),
                              "★":  st.column_config.TextColumn(width="small"),
                          })
+
+        st.markdown("---")
+        st.markdown("### 🔁 Similar players")
+        n_sim = st.slider("Number of similar players", 5, 50, 15, key="sim_slider")
+        sim_df = find_similar(player, active_profile, master, wy_df, si_df, n=n_sim)
+        if sim_df.empty:
+            st.info("No similar players found.")
+        else:
+            def sim_colour(val):
+                if not isinstance(val, (int, float)):
+                    return ""
+                if val >= 90: return "background-color:#d4edda;color:#155724"
+                if val >= 75: return "background-color:#fff3cd;color:#856404"
+                return ""
+            st.dataframe(
+                sim_df.style.map(sim_colour, subset=["Similarity"]),
+                hide_index=True, use_container_width=True,
+            )
 
 # ── Profile tabs view ────────────────────────────────────────────────────────
 else:
