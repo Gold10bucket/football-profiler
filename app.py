@@ -762,6 +762,7 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
             "Mins":          int(mins) if mins else "—",
             "Global":        round(gl * 100, 1),
             "No Finishing":  round(gl_nf * 100, 1) if gl_nf is not None else None,
+            "Δ Fin":         round((gl_nf - gl) * 100, 1) if gl_nf is not None else None,
             "Wyscout":       round(wy_s * 100, 1) if wy_s is not None else None,
             "SICS":          round(si_s * 100, 1) if si_s is not None else None,
             "Data %":        f"{cov*100:.0f}%",
@@ -769,7 +770,7 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
 
     has_sics = si_df is not None
     if not rows:
-        cols = ["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout"]
+        cols = ["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Δ Fin", "Wyscout"]
         if has_sics:
             cols += ["SICS"]
         cols += ["Data %"]
@@ -1329,12 +1330,22 @@ else:
                 if val >= 50: return "background-color:#fff3cd;color:#856404"
                 return "background-color:#f8d7da;color:#721c24"
 
-            _cols = ["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout"]
+            def delta_colour(val):
+                if not isinstance(val, (int, float)):
+                    return ""
+                if val > 3:  return "background-color:#d4edda;color:#155724"
+                if val < -3: return "background-color:#f8d7da;color:#721c24"
+                return ""
+
+            _cols = ["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Δ Fin", "Wyscout"]
             if si_df is not None:
                 _cols += ["SICS"]
             _cols += ["Data %"]
             display = scored[[c for c in _cols if c in scored.columns]]
+            _style_cols = ["Global", "No Finishing"] + (["Δ Fin"] if "Δ Fin" in display.columns else [])
             st.dataframe(
-                display.style.map(colour, subset=["Global", "No Finishing"]),
+                display.style
+                    .map(colour, subset=["Global", "No Finishing"])
+                    .map(delta_colour, subset=["Δ Fin"] if "Δ Fin" in display.columns else []),
                 use_container_width=True,
             )
