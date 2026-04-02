@@ -563,7 +563,7 @@ def _metric_vector(wy_row, si_row, metrics):
     return np.array(vec, dtype=float)
 
 
-def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile"):
+def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile", min_minutes=0):
     """
     Return DataFrame of most similar players using cosine similarity.
     mode='profile' → metrics from the selected profile only
@@ -595,6 +595,9 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
     for _, p in master.iterrows():
         if p["Player"] == player_name:
             continue
+        mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
+        if min_minutes > 0 and mins > 0 and mins < min_minutes:
+            continue
         pw_row = None
         if wy_df is not None:
             mask = wy_df["Player"] == p["Player"]
@@ -604,7 +607,6 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
         vec = _metric_vector(pw_row, ps_row, metrics)
         norm = np.linalg.norm(vec)
         cosine_sim = float(np.dot(ref_vec, vec) / (ref_norm * norm)) if ref_norm > 0 and norm > 0 else 0.0
-        mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
         by   = p.get("_birth_year")
         _, _, gl, _ = score_one(pw_row, ps_row, score_metrics, no_finishing=False)
         rows.append({
@@ -689,10 +691,11 @@ def build_export(master, wy_df, si_df):
                     v_wy = 1 - v_wy
             row[f"WY pct: {metric}"] = round(v_wy * 100, 1) if v_wy is not None else ""
 
-            v_si = None
-            if si_row is not None and metric in si_row.index and pd.notna(si_row[metric]):
-                v_si = float(si_row[metric])
-            row[f"SI pct: {metric}"] = round(v_si * 100, 1) if v_si is not None else ""
+            if si_df is not None:
+                v_si = None
+                if si_row is not None and metric in si_row.index and pd.notna(si_row[metric]):
+                    v_si = float(si_row[metric])
+                row[f"SI pct: {metric}"] = round(v_si * 100, 1) if v_si is not None else ""
 
         # Raw Wyscout stat columns
         if wy_row is not None:
@@ -701,7 +704,7 @@ def build_export(master, wy_df, si_df):
                     row[f"WY raw: {col}"] = wy_row[col]
 
         # Raw SICS computed values (non-percentile)
-        if si_row is not None:
+        if si_df is not None and si_row is not None:
             for col in si_row.index:
                 if not col.startswith("_"):
                     row[f"SI raw: {col}"] = round(float(si_row[col]), 4) if pd.notna(si_row[col]) else ""
@@ -764,8 +767,13 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
             "Data %":        f"{cov*100:.0f}%",
         })
 
+    has_sics = si_df is not None
     if not rows:
-        return pd.DataFrame(columns=["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"])
+        cols = ["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout"]
+        if has_sics:
+            cols += ["SICS"]
+        cols += ["Data %"]
+        return pd.DataFrame(columns=cols)
     df = pd.DataFrame(rows).sort_values("Global", ascending=False).reset_index(drop=True)
     df.index += 1
     return df
@@ -1140,8 +1148,9 @@ with st.sidebar:
     st.session_state.age_min, st.session_state.age_max = age_range
     filter_pos    = st.toggle("Filter by position group", True,
                                help="Only show players mapped to this position group")
-    matched_only  = st.toggle("Matched players only", False,
+    matched_only  = (st.toggle("Matched players only", False,
                                help="Only show players found in both Wyscout and SICS")
+                     if si_df is not None else False)
     no_finishing  = st.toggle("Without finishing", False,
                                help="Excludes xG, shots, goals, conversion rate")
     st.markdown("---")
@@ -1196,9 +1205,14 @@ if search.strip():
         wy_s, si_s, gl, cov = score_one(wy_row, si_row,
                                           PROFILES[active_profile]["metrics"], no_finishing)
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("Wyscout (70%)", f"{wy_s*100:.1f}" if wy_s is not None else "—")
-        with c2: st.metric("SICS (30%)",    f"{si_s*100:.1f}" if si_s is not None else "—")
+        if si_df is not None:
+            c1, c2, c3, c4 = st.columns(4)
+        else:
+            c1, c3, c4 = st.columns(3)
+            c2 = None
+        with c1: st.metric("Wyscout (70%)" if si_df is not None else "Score", f"{wy_s*100:.1f}" if wy_s is not None else "—")
+        if c2 is not None:
+            with c2: st.metric("SICS (30%)", f"{si_s*100:.1f}" if si_s is not None else "—")
         with c3: st.metric("Global",        f"{gl*100:.1f}"   if gl   is not None else "—")
         with c4: st.metric("Data coverage", f"{cov*100:.0f}%")
 
@@ -1260,7 +1274,8 @@ if search.strip():
                 key="sim_mode",
             )
         sim_df = find_similar(player, active_profile, master, wy_df, si_df, n=n_sim,
-                              mode="profile" if sim_mode == "Profile metrics" else "full")
+                              mode="profile" if sim_mode == "Profile metrics" else "full",
+                              min_minutes=st.session_state.min_mins)
         if sim_df.empty:
             st.info("No similar players found.")
         else:
@@ -1314,7 +1329,11 @@ else:
                 if val >= 50: return "background-color:#fff3cd;color:#856404"
                 return "background-color:#f8d7da;color:#721c24"
 
-            display = scored[["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout", "SICS", "Data %"]]
+            _cols = ["Player", "Team", "League", "Age", "Pos", "Mins", "Global", "No Finishing", "Wyscout"]
+            if si_df is not None:
+                _cols += ["SICS"]
+            _cols += ["Data %"]
+            display = scored[[c for c in _cols if c in scored.columns]]
             st.dataframe(
                 display.style.map(colour, subset=["Global", "No Finishing"]),
                 use_container_width=True,
