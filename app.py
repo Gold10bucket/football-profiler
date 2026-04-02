@@ -21,7 +21,7 @@ st.set_page_config(
 # ─── Constants ────────────────────────────────────────────────────────────────
 WY_WEIGHT = 0.70
 SI_WEIGHT = 0.30
-FINISHING = {"Buts hors penaltys / 90", "xG / 90", "Tirs / 90", "% conversion buts"}
+FINISHING = {"Buts hors penaltys / 90", "% conversion buts"}
 
 # Metrics where lower raw value = better (score gets flipped after percentile rank)
 INVERTED = {
