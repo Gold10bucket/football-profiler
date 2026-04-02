@@ -254,16 +254,11 @@ def process_wyscout(file_bytes: bytes) -> pd.DataFrame:
     league_col = _col(["League", "league", "Competition", "Lega"])
     df["_league"] = df[league_col].fillna("") if league_col else ""
 
-    # Detect minutes column (Wyscout exports vary; \n→_ normalisation above)
-    _min_candidates = ["Minutes played", "Minutes_played", "Minutes", "Mins played",
-                       "Mins_played", "Mins", "Min", "Min."]
-    _min_col = next((c for c in _min_candidates if c in df.columns), None)
-    if _min_col is None:
-        # Fallback: first column whose normalised name contains "minut" or "min"
-        _min_col = next((c for c in df.columns
-                         if re.search(r"\bmin", c, re.IGNORECASE)), None)
-    if _min_col:
-        df["_minutes"] = pd.to_numeric(df[_min_col], errors="coerce").fillna(0)
+    # Detect minutes column (Wyscout exports vary)
+    for _mc in ["Minutes played", "Minutes", "Mins played", "Min"]:
+        if _mc in df.columns:
+            df["_minutes"] = pd.to_numeric(df[_mc], errors="coerce").fillna(0)
+            break
     else:
         df["_minutes"] = np.nan  # not available — won't be filtered out
 
@@ -676,7 +671,7 @@ def build_export(master, wy_df, si_df):
             "Team":        player["Team"],
             "Position":    player.get("_position_group", ""),
             "Birth Year":  player.get("_birth_year", ""),
-            "Minutes":     (int(player["Minutes"]) if pd.notna(player.get("Minutes")) and player.get("Minutes") not in ("", "—") else ""),
+            "Minutes":     player.get("Minutes", ""),
         }
 
         # Profile scores (with and without finishing)
