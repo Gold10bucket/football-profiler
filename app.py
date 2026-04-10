@@ -563,7 +563,7 @@ def _metric_vector(wy_row, si_row, metrics):
     return np.array(vec, dtype=float)
 
 
-def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile", min_minutes=0, leagues=None):
+def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile", min_minutes=0, leagues=None, age_min=15, age_max=45):
     """
     Return DataFrame of most similar players using cosine similarity.
     mode='profile' → metrics from the selected profile only
@@ -600,6 +600,11 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
             continue
         if leagues and p.get("League", "") not in leagues:
             continue
+        by = p.get("_birth_year")
+        if pd.notna(by):
+            age = 2025 - int(by)
+            if not (age_min <= age <= age_max):
+                continue
         pw_row = None
         if wy_df is not None:
             mask = wy_df["Player"] == p["Player"]
@@ -1287,7 +1292,9 @@ if search.strip():
         sim_df = find_similar(player, active_profile, master, wy_df, si_df, n=n_sim,
                               mode="profile" if sim_mode == "Profile metrics" else "full",
                               min_minutes=st.session_state.min_mins,
-                              leagues=selected_leagues or None)
+                              leagues=selected_leagues or None,
+                              age_min=st.session_state.age_min,
+                              age_max=st.session_state.age_max)
         if sim_df.empty:
             st.info("No similar players found.")
         else:
