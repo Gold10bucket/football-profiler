@@ -563,7 +563,7 @@ def _metric_vector(wy_row, si_row, metrics):
     return np.array(vec, dtype=float)
 
 
-def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile", min_minutes=0):
+def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="profile", min_minutes=0, leagues=None):
     """
     Return DataFrame of most similar players using cosine similarity.
     mode='profile' → metrics from the selected profile only
@@ -597,6 +597,8 @@ def find_similar(player_name, profile_name, master, wy_df, si_df, n=15, mode="pr
             continue
         mins = float(p["Minutes"]) if pd.notna(p.get("Minutes")) else 0
         if min_minutes > 0 and mins > 0 and mins < min_minutes:
+            continue
+        if leagues and p.get("League", "") not in leagues:
             continue
         pw_row = None
         if wy_df is not None:
@@ -716,7 +718,7 @@ def build_export(master, wy_df, si_df):
 
 def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
                       min_minutes=0, position_group=None, matched_only=False,
-                      age_min=15, age_max=45):
+                      age_min=15, age_max=45, leagues=None):
     metrics = PROFILES[profile_name]["metrics"]
     rows = []
     for _, p in master.iterrows():
@@ -724,6 +726,8 @@ def score_all_players(master, wy_df, si_df, profile_name, no_finishing=False,
         if position_group and p.get("_position_group") not in (position_group, "Unknown"):
             continue
         if matched_only and pd.isna(p.get("_si")):
+            continue
+        if leagues and p.get("League", "") not in leagues:
             continue
         by = p.get("_birth_year")
         if pd.notna(by):
@@ -1152,6 +1156,12 @@ with st.sidebar:
     matched_only  = (st.toggle("Matched players only", False,
                                help="Only show players found in both Wyscout and SICS")
                      if si_df is not None else False)
+    # League filter (only when Wyscout data provides league info)
+    all_leagues = sorted(l for l in master["League"].dropna().unique() if l != "") if master is not None and "League" in master.columns else []
+    if all_leagues:
+        selected_leagues = st.multiselect("League", all_leagues, placeholder="All leagues")
+    else:
+        selected_leagues = []
     no_finishing  = st.toggle("Without finishing", False,
                                help="Excludes xG, shots, goals, conversion rate")
     st.markdown("---")
@@ -1276,7 +1286,8 @@ if search.strip():
             )
         sim_df = find_similar(player, active_profile, master, wy_df, si_df, n=n_sim,
                               mode="profile" if sim_mode == "Profile metrics" else "full",
-                              min_minutes=st.session_state.min_mins)
+                              min_minutes=st.session_state.min_mins,
+                              leagues=selected_leagues or None)
         if sim_df.empty:
             st.info("No similar players found.")
         else:
@@ -1318,6 +1329,7 @@ else:
                 matched_only=matched_only,
                 age_min=st.session_state.age_min,
                 age_max=st.session_state.age_max,
+                leagues=selected_leagues or None,
             )
             if scored.empty:
                 st.info("No players found. Try lowering the minutes threshold or disabling position filter.")
